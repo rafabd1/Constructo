@@ -277,6 +277,7 @@ class AIAgent:
             if parsed_response.get("next_step"):
                 action = parsed_response["next_step"]
                 if action.get("command"):
+                    # Executar comando
                     stdout, stderr, returncode = self.linux.run_command(action['command'])
                     
                     # Log command execution
@@ -288,6 +289,9 @@ class AIAgent:
                     
                     # Se precisar continuar, enviar resultado para análise
                     if parsed_response.get("continue", False):
+                        # Adicionar mensagem de análise
+                        self.terminal.log("Analyzing command output...", "ANALYZING")
+                        
                         next_prompt = f"""System: {self.system_prompt}
 
                         Analyze this command output and determine the next step:

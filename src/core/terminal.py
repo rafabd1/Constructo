@@ -257,6 +257,15 @@ class UnifiedTerminal:
         
     def log_command(self, command: str, output: str, return_code: int):
         """Log command execution with full details"""
+        # Log no terminal
+        self.log(f"Executing: {command}", "EXEC")
+        
+        if output.strip():
+            # Se houver saída, exibir com estilo apropriado
+            style = "ERROR" if return_code != 0 else "OUTPUT"
+            self.log(output.strip(), style)  # Adicionado .strip() para remover linhas em branco extras
+        
+        # Log detalhado no arquivo
         self._save_interaction_to_file({
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "type": "COMMAND",
