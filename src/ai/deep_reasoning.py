@@ -115,7 +115,7 @@ class DeepReasoning:
                 
         raise last_error or Exception("Maximum retry attempts reached")
 
-    async def deep_analyze(self, situation: str, context: str) -> Dict[str, Any]:
+    async def deep_analyze(self, situation: str, context: str = "") -> dict:
         try:
             self.agent.terminal.start_deep_reasoning()
             perspectives_results = []
@@ -173,11 +173,8 @@ class DeepReasoning:
                         situation,
                         language
                     )
-                    return {
-                        "type": "analysis",
-                        "analysis": final_analysis["analysis"],
-                        "next_step": None
-                    }
+                    synthesis_result = final_analysis["analysis"]
+                    synthesis_response = final_analysis["next_step"]
                 except Exception as synthesis_error:
                     # If synthesis fails, combine individual analyses
                     self.agent.terminal.log(f"Synthesis failed: {str(synthesis_error)}", "WARNING")
@@ -185,22 +182,50 @@ class DeepReasoning:
                         f"From {p['perspective']} perspective:\n{p['analysis']}"
                         for p in perspectives_results
                     ])
-                    return {
-                        "type": "analysis",
-                        "analysis": combined_analysis,
-                        "next_step": None
-                    }
+                    synthesis_result = combined_analysis
+                    synthesis_response = None
                     
             except Exception as e:
                 self.agent.terminal.log(f"Error in deep analysis: {str(e)}", "ERROR")
-                return {
+                synthesis_result = {
                     "type": "error",
                     "message": "Deep analysis failed",
                     "next_step": None
                 }
+                synthesis_response = None
             
-        finally:
-            self.agent.terminal.stop_processing()
+            # Log da síntese antes do processamento
+            self.agent.terminal._save_interaction_to_file({
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "type": "DEEP_REASONING_SYNTHESIS",
+                "content": synthesis_result,
+                "raw_synthesis": synthesis_response
+            })
+            
+            try:
+                # Garantir que a síntese está no formato JSON correto
+                if isinstance(synthesis_result, str):
+                    synthesis_result = {
+                        "type": "analysis",
+                        "message": synthesis_result,
+                        "requires_deep_reasoning": False,
+                        "continue": True
+                    }
+                
+                return synthesis_result
+                
+            except Exception as e:
+                self.agent.terminal._save_interaction_to_file({
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "type": "DEEP_REASONING_ERROR",
+                    "error": str(e),
+                    "synthesis_result": synthesis_result
+                })
+                raise e
+            
+        except Exception as e:
+            self.agent.terminal.log(f"Deep Reasoning failed: {str(e)}", "ERROR")
+            return {"type": "error", "message": str(e)}
     
     def _temp_configure_model(self, config: Dict) -> Dict:
         """

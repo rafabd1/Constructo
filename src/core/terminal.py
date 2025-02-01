@@ -136,7 +136,7 @@ class UnifiedTerminal:
         )
         self.live.start()
         
-        self._save_to_file({
+        self._save_interaction_to_file({
             "timestamp": datetime.now().strftime("%H:%M:%S"),
             "type": "DEEP_REASONING",
             "content": "Starting Deep Reasoning analysis"
@@ -146,7 +146,7 @@ class UnifiedTerminal:
         """Logs a Deep Reasoning step under the header with dimmed style"""
         if self.live:
             self.console.print(f"[dim]  → {message}[/dim]")
-            self._save_to_file({
+            self._save_interaction_to_file({
                 "timestamp": datetime.now().strftime("%H:%M:%S"),
                 "type": "DEEP_REASONING_STEP",
                 "content": message
@@ -166,16 +166,34 @@ class UnifiedTerminal:
         self.clear_line()
         self.console.print()
         
-    def log(self, message: str, style: str = "INFO", show_timestamp: bool = True, end: str = "\n"):
-        """Logs a message with optional styling and timestamp"""
+    def _save_interaction_to_file(self, entry: dict):
+        """Save interaction log entry to file with proper formatting"""
         try:
-            style_color = self.log_styles.get(style, "")
+            # Add timestamp if not present
+            if "timestamp" not in entry:
+                entry["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             
-            if show_timestamp:
-                timestamp = datetime.now().strftime("%H:%M:%S")
-                formatted_message = f"[dark_green]{timestamp}[/dark_green] {message}"
-            else:
-                formatted_message = message
+            # Format JSON with indentation for better readability
+            formatted_json = json.dumps(entry, indent=2, ensure_ascii=False)
+            
+            with open(self.log_file, 'a', encoding='utf-8') as f:
+                f.write(formatted_json + "\n")
+        except Exception as e:
+            # If primary log fails, try backup location
+            try:
+                backup_file = os.path.expanduser("~/constructo_agent.log")
+                with open(backup_file, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(entry, indent=2, ensure_ascii=False) + "\n")
+            except:
+                # If both fail, just print warning (don't affect main flow)
+                print(f"\nWarning: Could not write to log files: {str(e)}")
+    
+    def log(self, message: str, style: str = "INFO", end: str = "\n", show_timestamp: bool = True):
+        """Display log message in terminal"""
+        try:
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            formatted_message = f"{timestamp} {message}" if show_timestamp else message
+            style_color = self.log_styles.get(style)
             
             if style_color:
                 if show_timestamp:
@@ -185,18 +203,19 @@ class UnifiedTerminal:
             else:
                 self.console.print(formatted_message, end=end)
             
-            if show_timestamp:
-                self._save_to_file({
-                    "timestamp": datetime.now().strftime("%H:%M:%S"),
+            # Only log important interactions
+            if style in ["EXEC", "OUTPUT", "AGENT"]:
+                self._save_interaction_to_file({
+                    "timestamp": timestamp,
                     "type": style,
-                    "content": message
+                    "content": message,
+                    "raw_response": getattr(self, '_last_raw_response', None)  # Save raw response if available
                 })
-            
         except Exception as e:
             # Fallback to basic print if rich console fails
             print(f"Logging error: {str(e)}")
             print(message)
-            
+        
     def clear_line(self):
         """Clears the last line of the terminal without using ANSI codes"""
         print("\r", end="")  # Return cursor to the beginning of the line
@@ -213,36 +232,39 @@ class UnifiedTerminal:
         self.console.print()  # New line to clear formatting
         return Confirm.ask(message, default=False)
             
-    def _save_to_file(self, entry: dict):
-        """Save log entry to file with error handling"""
-        try:
-            with open(self.log_file, 'a', encoding='utf-8') as f:
-                f.write(json.dumps(entry) + "\n")
-        except (PermissionError, OSError) as e:
-            # If we can't write to file, just print warning and continue
-            print(f"\nWarning: Could not write to log file: {str(e)}")
-            # Try to write to user's home directory instead
-            try:
-                home_log = os.path.expanduser("~/constructo_agent.log")
-                with open(home_log, 'a', encoding='utf-8') as f:
-                    f.write(json.dumps(entry) + "\n")
-            except:
-                # If that also fails, just skip logging to file
-                pass
-            
     def log_agent(self, message: str):
-        """Displays 'Agent' message in cyan style with timestamp"""
+        """Log agent message with full context"""
         timestamp = datetime.now().strftime("%H:%M:%S")
-        entry = {
-            "timestamp": timestamp,
-            "type": "AGENT",
-            "content": message
-        }
-        self.messages.append(entry)
-        self._save_to_file(entry)
         
-        # Clear previous line and print message
+        # Display in terminal
         self.clear_line()
         self.console.print(
             f"[dim]{timestamp}[/dim] [{self.log_styles['AGENT']}][Agent][/] {message}"
         )
+        
+        # Save detailed interaction log
+        self._save_interaction_to_file({
+            "timestamp": timestamp,
+            "type": "AGENT",
+            "content": message,
+            "raw_response": getattr(self, '_last_raw_response', None),
+            "context": {
+                "requires_deep_reasoning": getattr(self, '_current_deep_reasoning', False),
+                "command_context": getattr(self, '_current_command_context', None),
+                "analysis_type": getattr(self, '_current_analysis_type', None)
+            }
+        })
+        
+    def log_command(self, command: str, output: str, return_code: int):
+        """Log command execution with full details"""
+        self._save_interaction_to_file({
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "type": "COMMAND",
+            "command": command,
+            "output": output,
+            "return_code": return_code,
+            "context": {
+                "requires_deep_reasoning": getattr(self, '_current_deep_reasoning', False),
+                "command_context": getattr(self, '_current_command_context', None)
+            }
+        })
