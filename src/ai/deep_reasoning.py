@@ -29,37 +29,24 @@ class DeepReasoning:
         if not PERSPECTIVE_ANALYSIS_PROMPT or not SYNTHESIS_PROMPT:
             raise ValueError("Deep Reasoning prompts not properly imported")
             
-    def should_activate(self, situation_data: Dict) -> bool:
+    def should_activate(self, response: Dict) -> bool:
         """
-        Determines if Deep Reasoning should be activated based on:
-        1. Debug mode (forces activation)
-        2. Explicit request from main agent
-        3. Configured triggers from config.yaml
+        Determine if deep reasoning should be activated based on:
+        1. Explicit request from response
+        2. Consecutive failures threshold
         """
-
-        if self.config.get('debug_mode', False):
-            self.agent.terminal.log("Activating Deep Reasoning - Debug mode enabled", "DEBUG")
+        # Ativar se explicitamente solicitado
+        if response.get("requires_deep_reasoning", False):
             return True
         
-        if situation_data.get("requires_deep_reasoning", False):
+        # Ativar se atingiu limite de falhas consecutivas
+        if self.consecutive_failures >= self.activation_triggers.get('consecutive_failures', 4):
+            self.agent.terminal.log(
+                f"Activating Deep Reasoning - {self.consecutive_failures} consecutive failures detected",
+                "INFO"
+            )
             return True
         
-        triggers = self.activation_triggers
-        
-        if self.consecutive_failures >= triggers.get('consecutive_failures', 2):
-            return True
-        
-        if (triggers.get('high_risk_commands', True) and 
-            situation_data.get("next_step", {}).get("risk", "low") == "high"):
-            self.agent.terminal.log("Activating Deep Reasoning - High risk command detected", "INFO")
-            return True
-        
-        reasoning_context = situation_data.get('reasoning_context', {})
-        if (reasoning_context.get('complexity', 'low') == 'high' or
-            reasoning_context.get('impact_scope', 'low') == 'high'):
-            self.agent.terminal.log("Activating Deep Reasoning - High complexity/impact detected", "INFO")
-            return True
-            
         return False
         
     def record_result(self, success: bool):
@@ -155,43 +142,34 @@ class DeepReasoning:
                     )
                     continue
             
-            # If we couldn't get any perspective, return error
-            if not perspectives_results:
-                return {
-                    "type": "error",
-                    "message": "Failed to analyze from any perspective",
-                    "next_step": None
-                }
+            # Adicionar quebra de linha e mensagem após todas as perspectivas
+            self.agent.terminal.log("\nThinking through all perspectives...", "DIM", show_timestamp=False)
             
             try:
-                self.agent.terminal.log_deep_reasoning_step("Synthesizing perspectives...")
+                final_analysis = await self._synthesize_perspectives(
+                    perspectives_results, 
+                    situation,
+                    language
+                )
+                synthesis_result = final_analysis["analysis"]
+                synthesis_response = final_analysis["next_step"]
+            except Exception as synthesis_error:
+                # Se a síntese falhar, criar uma síntese manual das perspectivas
+                self.agent.terminal.log(f"Synthesis failed: {str(synthesis_error)}", "WARNING")
                 
-                # If there's a rate limit error in synthesis, use individual analyses
-                try:
-                    final_analysis = await self._synthesize_perspectives(
-                        perspectives_results, 
-                        situation,
-                        language
-                    )
-                    synthesis_result = final_analysis["analysis"]
-                    synthesis_response = final_analysis["next_step"]
-                except Exception as synthesis_error:
-                    # If synthesis fails, combine individual analyses
-                    self.agent.terminal.log(f"Synthesis failed: {str(synthesis_error)}", "WARNING")
-                    combined_analysis = "\n\n".join([
-                        f"From {p['perspective']} perspective:\n{p['analysis']}"
-                        for p in perspectives_results
-                    ])
-                    synthesis_result = combined_analysis
-                    synthesis_response = None
-                    
-            except Exception as e:
-                self.agent.terminal.log(f"Error in deep analysis: {str(e)}", "ERROR")
-                synthesis_result = {
-                    "type": "error",
-                    "message": "Deep analysis failed",
-                    "next_step": None
+                # Combinar análises de forma estruturada
+                combined_analysis = {
+                    "type": "analysis",
+                    "message": "Baseado na análise de múltiplas perspectivas:\n\n" + 
+                              "\n\n".join([
+                                  f"Da perspectiva {p['perspective']}:\n{p['analysis']}"
+                                  for p in perspectives_results
+                              ]),
+                    "requires_deep_reasoning": False,
+                    "continue": True
                 }
+                
+                synthesis_result = combined_analysis
                 synthesis_response = None
             
             # Log da síntese antes do processamento
@@ -262,18 +240,15 @@ class DeepReasoning:
         raise ValueError("No valid JSON found in response")
     
     async def _synthesize_perspectives(self, perspectives_results: List[Dict], situation: str, language: str) -> Dict:
-        """
-        Synthesizes different perspectives into a final analysis with streaming
-        """
+        """Synthesizes different perspectives into a final analysis"""
         synthesis_prompt = self._create_synthesis_prompt(perspectives_results, situation, language)
         
         try:
             # Stop the spinner before starting synthesis
             self.agent.terminal.stop_processing()
             
-            # Start synthesis streaming with line break
-            self.agent.terminal.log("\nThinking through all perspectives...", "DIM", show_timestamp=False)
-            await asyncio.sleep(0.5)  # Pause for visual separation
+            # Start synthesis with line break
+            self.agent.terminal.log("\nSintetizando análises...", "DIM")
             
             # Use shared rate limiter
             await self.rate_limiter.wait_if_needed_async()
@@ -285,58 +260,23 @@ class DeepReasoning:
             )
             
             full_response = ""
-            current_line = ""
             buffer = ""
-            last_char = " "
             
             for chunk in response:
                 if hasattr(chunk, 'text') and chunk.text:
-                    text = chunk.text.replace('\r', '')  # Remove carriage returns
-                    
-                    # Remove duplicate lines
-                    if text in full_response:
-                        continue
-                        
+                    text = chunk.text
                     full_response += text
+                    buffer += text
                     
-                    # Process text character by character
-                    for char in text:
-                        buffer += char
-                        
-                        # Handle line breaks
-                        if char == '\n':
-                            if buffer.strip() and buffer.strip() not in current_line:
-                                if current_line:
-                                    self.agent.terminal.log(current_line.rstrip(), "DIM", show_timestamp=False)
-                                current_line = buffer
-                                buffer = ""
-                                await asyncio.sleep(0.02)
-                        # Handle sentence endings
-                        elif char in ['.', '!', '?'] and last_char not in ['.', '!', '?']:
-                            self.agent.terminal.log(buffer, "DIM", show_timestamp=False, end="")
-                            buffer = ""
-                            await asyncio.sleep(0.1)
-                        # Handle other punctuation
-                        elif char in [',', ';', ':'] and last_char not in [',', ';', ':']:
-                            self.agent.terminal.log(buffer, "DIM", show_timestamp=False, end="")
-                            buffer = ""
-                            await asyncio.sleep(0.05)
-                        # Regular character printing
-                        elif len(buffer) > 2:  # Print in small word chunks
-                            self.agent.terminal.log(buffer, "DIM", show_timestamp=False, end="")
-                            buffer = ""
-                            await asyncio.sleep(0.01)
-                        
-                        last_char = char
+                    # Quando tiver texto suficiente ou encontrar pontuação
+                    if len(buffer) > 50 or any(p in buffer for p in ['.', '!', '?', '\n']):
+                        self.agent.terminal.log(buffer, "DIM", end="")
+                        buffer = ""
+                        await asyncio.sleep(0.01)
             
-            # Print any remaining text
-            if buffer.strip():
-                self.agent.terminal.log(buffer.rstrip(), "DIM", show_timestamp=False)
-            if current_line.strip():
-                self.agent.terminal.log(current_line.rstrip(), "DIM", show_timestamp=False)
-            
-            # Add final line break
-            self.agent.terminal.log("", show_timestamp=False)
+            # Imprimir qualquer texto restante
+            if buffer:
+                self.agent.terminal.log(buffer, "DIM")
             
             return {
                 "type": "analysis",

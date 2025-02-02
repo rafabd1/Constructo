@@ -143,9 +143,13 @@ class UnifiedTerminal:
         })
         
     def log_deep_reasoning_step(self, message: str):
-        """Logs a Deep Reasoning step under the header with dimmed style"""
+        """Logs a Deep Reasoning step under the header"""
         if self.live:
-            self.console.print(f"[dim]  → {message}[/dim]")
+            # Traduzir mensagens comuns para inglês
+            message = message.replace("Analisando com perspectiva", "Analyzing with perspective")
+            message = message.replace("Sintetizando análises", "Synthesizing perspectives")
+            
+            self.console.print(f"  → {message}", style="dim")
             self._save_interaction_to_file({
                 "timestamp": datetime.now().strftime("%H:%M:%S"),
                 "type": "DEEP_REASONING_STEP",
@@ -192,27 +196,32 @@ class UnifiedTerminal:
         """Display log message in terminal"""
         try:
             timestamp = datetime.now().strftime("%H:%M:%S")
-            formatted_message = f"{timestamp} {message}" if show_timestamp else message
             style_color = self.log_styles.get(style)
             
+            # Formatar timestamp e identificador
+            timestamp_str = f"[dim]{timestamp}[/dim]" if show_timestamp else ""
+            style_id = f"[{style}]" if style else ""
+            
             if style_color:
-                if show_timestamp:
-                    self.console.print(formatted_message, style=f"default {style_color}", end=end)
-                else:
-                    self.console.print(formatted_message, style=style_color, end=end)
+                formatted_message = f"{timestamp_str} {style_id} {message}"
+                self.console.print(formatted_message, style=style_color, end=end)
             else:
-                self.console.print(formatted_message, end=end)
+                self.console.print(f"{timestamp_str} {style_id} {message}", end=end)
             
             # Only log important interactions
-            if style in ["EXEC", "OUTPUT", "AGENT"]:
+            if style in ["EXEC", "OUTPUT", "AGENT", "ERROR"]:
+                # Criar novo raw_response para cada log
+                current_raw = None
+                if hasattr(self, '_current_raw_response'):
+                    current_raw = self._current_raw_response
+                
                 self._save_interaction_to_file({
                     "timestamp": timestamp,
                     "type": style,
                     "content": message,
-                    "raw_response": getattr(self, '_last_raw_response', None)  # Save raw response if available
+                    "raw_response": current_raw
                 })
         except Exception as e:
-            # Fallback to basic print if rich console fails
             print(f"Logging error: {str(e)}")
             print(message)
         
@@ -257,13 +266,21 @@ class UnifiedTerminal:
         
     def log_command(self, command: str, output: str, return_code: int):
         """Log command execution with full details"""
-        # Log no terminal
-        self.log(f"Executing: {command}", "EXEC")
+        # Log do comando primeiro
+        self.log(f"Executing command: {command}", "EXEC")
         
-        if output.strip():
-            # Se houver saída, exibir com estilo apropriado
+        # Esperar um momento para melhor visualização
+        time.sleep(0.1)
+        
+        # Se houver saída, escapar caracteres especiais e exibir
+        if output:  # Removido .strip() para preservar formatação
+            # Escapar caracteres que podem ser interpretados como tags Rich
+            safe_output = output.replace('[', '\\[').replace(']', '\\]')
             style = "ERROR" if return_code != 0 else "OUTPUT"
-            self.log(output.strip(), style)  # Adicionado .strip() para remover linhas em branco extras
+            self.log(safe_output.rstrip(), style)  # Usar rstrip() para remover quebras extras no final
+        
+        # Sempre adicionar uma linha de espaço após o output
+        self.console.print()
         
         # Log detalhado no arquivo
         self._save_interaction_to_file({
