@@ -1,49 +1,47 @@
 from typing import List, Dict
 
-PERSPECTIVE_ANALYSIS_PROMPT = """Analyze this pentesting situation from a {perspective} perspective:
+PERSPECTIVE_ANALYSIS_PROMPT = """Analyze this security situation from a {perspective} mindset:
 
 Situation: {situation}
 Context: {context}
 
-Consider:
-1. Key risks and immediate concerns
-2. Most promising opportunities
-3. Most effective actions
-4. Critical context implications
-5. Priority recommendations
+Think about:
+1. What are the critical security risks?
+2. What vulnerabilities could be exploited?
+3. What attack vectors should we consider?
+4. What defensive measures are needed?
+5. What immediate actions should be taken to 
 
-Be concise and focus on the most important points. Limit your response to 14 lines.
-Express your thoughts naturally, but be direct and specific.
+Focus on providing actionable insights from your perspective.
+Be direct and specific in your analysis.
+Limit response to 14 lines.
 
-Important: Provide your analysis in {language}."""
+Important: Analyze in {language}."""
 
-SYNTHESIS_PROMPT = """Let's synthesize these different perspectives into a unified analysis:
+SYNTHESIS_PROMPT = """Let me think through everything we've learned about this situation...
 
 Situation: {situation}
 
-I've analyzed this from multiple angles. Let me think through what we've learned...
+Recent conversation context:
+{context}
 
-Consider:
-1. What common themes emerge from these perspectives?
-2. Where do the approaches differ and why?
-3. What's the most logical path forward?
-4. What risks need special attention?
-5. What should be our immediate next steps?
-
-Perspectives to consider:
+Previous analyses:
 {perspectives}
 
-Think through this carefully and provide a comprehensive analysis, focusing on:
-- Key insights from each perspective
-- Most important risks and opportunities
-- Concrete action steps
-- Critical considerations
+Let me process this information...
 
-Express your thoughts naturally, as if working through the problem step by step.
-Do not use any special formatting or markdown in your response.
-Keep the text clean and simple.
+Consider:
+1. What are the most critical findings?
+2. What vulnerabilities pose the greatest risk?
+3. What defensive measures are most urgent?
+4. What specific actions need to be taken?
+5. What's the best approach to address this?
 
-Important: Provide your synthesis in {language}."""
+Think through each point carefully.
+Focus on forming a complete understanding.
+Develop a clear action plan.
+
+Important: Think in {language}."""
 
 def _format_perspectives(self, perspectives_results: List[Dict]) -> str:
     """

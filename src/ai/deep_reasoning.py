@@ -59,7 +59,7 @@ class DeepReasoning:
     async def _send_message(self, prompt: str, config: Dict = None) -> str:
         """Send message using dedicated Deep Reasoning model"""
         max_attempts = self.agent.retry_config.get('max_attempts', 3)
-        retry_delay = self.agent.retry_config.get('delay_between_retries', 10)
+        retry_delay = self.agent.retry_config.get('delay_between_retries', 20)
         last_error = None
         
         for attempt in range(max_attempts):
@@ -107,6 +107,14 @@ class DeepReasoning:
             self.agent.terminal.start_deep_reasoning()
             perspectives_results = []
             
+            # Obter histórico do chat
+            chat_history = self.agent.chat.history[-15:]  # Últimas 15 mensagens
+            formatted_history = "\n".join([
+                f"[{msg['role']}]: {msg['parts'][0]}"
+                for msg in chat_history
+                if msg['parts'] and msg['parts'][0]
+            ])
+            
             # Obter a linguagem configurada
             language = self.agent.config.get('agent', {}).get('language', 'en-US')
             
@@ -119,7 +127,7 @@ class DeepReasoning:
                     formatted_prompt = PERSPECTIVE_ANALYSIS_PROMPT.format(
                         perspective=perspective_name,
                         situation=str(situation),
-                        context=str(context),
+                        context=formatted_history,  # Usar histórico do chat
                         language=language
                     )
                     
@@ -135,6 +143,13 @@ class DeepReasoning:
                     
                     perspectives_results.append(perspective_result)
                     
+                    # Adicionar perspectiva ao contexto
+                    self.agent.context_manager.add_to_context({
+                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                        "type": "PERSPECTIVE",
+                        "content": f"{perspective_name}: {response[:100]}..."  # Primeiros 100 caracteres
+                    })
+                    
                 except Exception as e:
                     self.agent.terminal.log(
                         f"Error in {perspective_name} analysis: {str(e)}", 
@@ -142,13 +157,14 @@ class DeepReasoning:
                     )
                     continue
             
-            # Adicionar quebra de linha e mensagem após todas as perspectivas
-            self.agent.terminal.log("\nThinking through all perspectives...", "DIM", show_timestamp=False)
+            # Adicionar o thinking como último step
+            self.agent.terminal.log_deep_reasoning_step("Thinking through all perspectives...")
             
             try:
                 final_analysis = await self._synthesize_perspectives(
                     perspectives_results, 
                     situation,
+                    formatted_history,  # Passar histórico para síntese
                     language
                 )
                 synthesis_result = final_analysis["analysis"]
@@ -189,6 +205,13 @@ class DeepReasoning:
                         "requires_deep_reasoning": False,
                         "continue": True
                     }
+                
+                # Adicionar síntese ao contexto
+                self.agent.context_manager.add_to_context({
+                    "timestamp": datetime.now().strftime("%H:%M:%S"),
+                    "type": "SYNTHESIS",
+                    "content": synthesis_result.get("message", "")[:200] + "..."  # Primeiros 200 caracteres
+                })
                 
                 return synthesis_result
                 
@@ -239,17 +262,16 @@ class DeepReasoning:
         
         raise ValueError("No valid JSON found in response")
     
-    async def _synthesize_perspectives(self, perspectives_results: List[Dict], situation: str, language: str) -> Dict:
+    async def _synthesize_perspectives(self, perspectives_results: List[Dict], situation: str, context: str, language: str) -> Dict:
         """Synthesizes different perspectives into a final analysis"""
-        synthesis_prompt = self._create_synthesis_prompt(perspectives_results, situation, language)
+        synthesis_prompt = self._create_synthesis_prompt(
+            perspectives_results, 
+            situation,
+            context,  # Passar contexto do chat
+            language
+        )
         
         try:
-            # Stop the spinner before starting synthesis
-            self.agent.terminal.stop_processing()
-            
-            # Start synthesis with line break
-            self.agent.terminal.log("\nSintetizando análises...", "DIM")
-            
             # Use shared rate limiter
             await self.rate_limiter.wait_if_needed_async()
             
@@ -270,13 +292,13 @@ class DeepReasoning:
                     
                     # Quando tiver texto suficiente ou encontrar pontuação
                     if len(buffer) > 50 or any(p in buffer for p in ['.', '!', '?', '\n']):
-                        self.agent.terminal.log(buffer, "DIM", end="")
+                        self.agent.terminal.log(buffer, "DIM", show_timestamp=False)
                         buffer = ""
                         await asyncio.sleep(0.01)
             
             # Imprimir qualquer texto restante
             if buffer:
-                self.agent.terminal.log(buffer, "DIM")
+                self.agent.terminal.log(buffer, "DIM", show_timestamp=False)
             
             return {
                 "type": "analysis",
@@ -296,11 +318,12 @@ class DeepReasoning:
                 "next_step": None
             }
     
-    def _create_synthesis_prompt(self, perspectives_results: List[Dict], situation: str, language: str) -> str:
+    def _create_synthesis_prompt(self, perspectives_results: List[Dict], situation: str, context: str, language: str) -> str:
         """Creates the prompt to synthesize different perspectives"""
         return get_synthesis_prompt(language).format(
             situation=situation,
             perspectives=self._format_perspectives(perspectives_results),
+            context=context,  # Incluir contexto do chat
             language=language
         )
 
