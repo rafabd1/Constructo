@@ -198,6 +198,11 @@ class UnifiedTerminal:
             timestamp = datetime.now().strftime("%H:%M:%S")
             style_color = self.log_styles.get(style)
             
+            # Se for DIM, não mostrar o estilo no output
+            if style == "DIM":
+                self.console.print(message, end=end)
+                return
+            
             # Formatar timestamp e identificador
             timestamp_str = f"[dim]{timestamp}[/dim]" if show_timestamp else ""
             style_id = f"[{style}]" if style else ""
@@ -210,16 +215,11 @@ class UnifiedTerminal:
             
             # Only log important interactions
             if style in ["EXEC", "OUTPUT", "AGENT", "ERROR"]:
-                # Criar novo raw_response para cada log
-                current_raw = None
-                if hasattr(self, '_current_raw_response'):
-                    current_raw = self._current_raw_response
-                
                 self._save_interaction_to_file({
                     "timestamp": timestamp,
                     "type": style,
                     "content": message,
-                    "raw_response": current_raw
+                    "raw_response": getattr(self, '_current_raw_response', None)
                 })
         except Exception as e:
             print(f"Logging error: {str(e)}")

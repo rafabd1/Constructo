@@ -212,18 +212,16 @@ class AIAgent:
     async def execute_step(self, parsed_response, context_info: str = None):
         try:
             # Check if deep reasoning is needed
-            should_activate = (
-                parsed_response.get("requires_deep_reasoning", False) and
-                not hasattr(self, '_in_deep_reasoning')  # Prevent loops
-            )
+            should_activate = parsed_response.get("requires_deep_reasoning", False)
+            
+            # Se já estiver em deep reasoning, não ativar novamente
+            if hasattr(self, '_in_deep_reasoning'):
+                should_activate = False
             
             if should_activate:
-                # Mostrar mensagem antes de iniciar Deep Reasoning
-                if parsed_response.get("message"):
-                    self.terminal.log_agent(parsed_response["message"])
-                    await asyncio.sleep(0.5)  # Pequena pausa para melhor visualização
-                
+                # Marcar que está em deep reasoning
                 self._in_deep_reasoning = True
+                
                 try:
                     # Passar o contexto_info diretamente para deep_analyze
                     deep_analysis = await self.deep_reasoning.deep_analyze(
@@ -232,14 +230,59 @@ class AIAgent:
                     )
                     
                     # Limpar flag após análise
-                    delattr(self, '_in_deep_reasoning')
+                    if hasattr(self, '_in_deep_reasoning'):
+                        delattr(self, '_in_deep_reasoning')
                     
+                    # Processar a resposta do deep_analysis
                     if isinstance(deep_analysis, dict):
-                        return deep_analysis.get("message", "Analysis completed"), deep_analysis.get("continue", False)
+                        # Adicionar a síntese ao histórico
+                        self.chat.history.append({
+                            "role": "assistant",
+                            "parts": [deep_analysis["message"]]
+                        })
+                        
+                        # Enviar análise para o modelo principal
+                        analysis_prompt = f"""System: {self.system_prompt}
+                        
+                        A deep analysis has been performed. Based on this analysis, determine the best action to take:
+
+                        Deep Reasoning Analysis:
+                        {deep_analysis["message"]}
+
+                        IMPORTANT: Do not include any commands in your response. Just analyze the situation and provide guidance.
+                        Please respond in the specified JSON format with type: "analysis" and continue: true."""
+                        
+                        # Obter resposta do modelo
+                        response = self.model.generate_content(analysis_prompt)
+                        
+                        if hasattr(response, 'parts') and response.parts:
+                            try:
+                                # Processar resposta
+                                response_text = response.parts[0].text
+                                
+                                # Não mostrar o JSON no terminal
+                                clean_text = re.sub(r'```json.*?```', '', response_text, flags=re.DOTALL)
+                                clean_text = re.sub(r'\{.*?\}', '', clean_text, flags=re.DOTALL)
+                                
+                                if clean_text.strip():
+                                    self.terminal.log_agent(clean_text.strip())
+                                
+                                # Retornar para continuar o fluxo normal
+                                return deep_analysis["message"], True
+                                
+                            except Exception as e:
+                                self.terminal.log(f"Error processing model response: {str(e)}", "ERROR")
+                        
+                        # Fallback: continuar com a análise original
+                        return deep_analysis["message"], True
+                    
                     return str(deep_analysis), False
                     
                 except Exception as e:
-                    delattr(self, '_in_deep_reasoning')
+                    # Limpar flag em caso de erro
+                    if hasattr(self, '_in_deep_reasoning'):
+                        delattr(self, '_in_deep_reasoning')
+                        
                     error_msg = f"Deep Reasoning failed: {str(e)}"
                     self.terminal.log(error_msg, "ERROR")
                     return error_msg, False
@@ -258,35 +301,15 @@ class AIAgent:
                     # Executar comando
                     output, returncode = self.linux.run_command(action['command'])
                     
-                    # Log único do comando e output
+                    # Log do comando e output
                     self.terminal.log_command(action['command'], output, returncode)
                     
-                    # Se precisar continuar, enviar resultado para análise
-                    if parsed_response.get("continue", False):
-                        # Adicionar mensagem de análise
-                        self.terminal.log("Analyzing command output...", "ANALYZING")
-                        
-                        next_prompt = f"""System: {self.system_prompt}
-
-                        Analyze this command output and determine the next step:
-                        Command: {action['command']}
-                        Return code: {returncode}
-                        Output: {output}
-
-                        CRITICAL: RESPOND WITH EXACT JSON FORMAT INCLUDING NEXT STEP."""
-
-                        next_response = await self._send_message_with_retry(next_prompt)
-                        
-                        if next_response:
-                            try:
-                                clean_text = re.sub(r"```json\s*([\s\S]*?)```", r"\1", next_response)
-                                next_parsed = json.loads(_extract_json(clean_text))
-                                return next_response, True
-                            except Exception as e:
-                                self.terminal.log(f"Error parsing response: {str(e)}", "ERROR")
-                                return str(e), False
+                    # Se o comando falhou, retornar erro
+                    if returncode != 0:
+                        return f"Command failed with code {returncode}: {output}", False
                     
-                    return output if output else "Command completed successfully", False
+                    # Processar output do comando
+                    return output, parsed_response.get("continue", False)
             
             # Se não tiver next_step, retornar apenas a mensagem
             return parsed_response.get("message", ""), parsed_response.get("continue", False)

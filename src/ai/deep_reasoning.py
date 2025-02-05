@@ -110,14 +110,15 @@ class DeepReasoning:
             # Obter histórico do chat
             chat_history = self.agent.chat.history[-15:]  # Últimas 15 mensagens
             formatted_history = "\n".join([
-                f"[{msg['role']}]: {msg['parts'][0]}"
+                f"[{msg.role}]: {msg.parts[0].text if msg.parts else ''}"
                 for msg in chat_history
-                if msg['parts'] and msg['parts'][0]
+                if hasattr(msg, 'role') and hasattr(msg, 'parts')
             ])
             
             # Obter a linguagem configurada
             language = self.agent.config.get('agent', {}).get('language', 'en-US')
             
+            # Analisar perspectivas
             for perspective_name, perspective_cfg in self.perspectives.items():
                 self.agent.terminal.log_deep_reasoning_step(
                     f"Analyzing with {perspective_name} perspective..."
@@ -127,7 +128,7 @@ class DeepReasoning:
                     formatted_prompt = PERSPECTIVE_ANALYSIS_PROMPT.format(
                         perspective=perspective_name,
                         situation=str(situation),
-                        context=formatted_history,  # Usar histórico do chat
+                        context=formatted_history,
                         language=language
                     )
                     
@@ -143,13 +144,6 @@ class DeepReasoning:
                     
                     perspectives_results.append(perspective_result)
                     
-                    # Adicionar perspectiva ao contexto
-                    self.agent.context_manager.add_to_context({
-                        "timestamp": datetime.now().strftime("%H:%M:%S"),
-                        "type": "PERSPECTIVE",
-                        "content": f"{perspective_name}: {response[:100]}..."  # Primeiros 100 caracteres
-                    })
-                    
                 except Exception as e:
                     self.agent.terminal.log(
                         f"Error in {perspective_name} analysis: {str(e)}", 
@@ -161,72 +155,50 @@ class DeepReasoning:
             self.agent.terminal.log_deep_reasoning_step("Thinking through all perspectives...")
             
             try:
-                final_analysis = await self._synthesize_perspectives(
+                # Sintetizar perspectivas
+                synthesis_result = await self._synthesize_perspectives(
                     perspectives_results, 
                     situation,
-                    formatted_history,  # Passar histórico para síntese
+                    formatted_history,
                     language
                 )
-                synthesis_result = final_analysis["analysis"]
-                synthesis_response = final_analysis["next_step"]
-            except Exception as synthesis_error:
-                # Se a síntese falhar, criar uma síntese manual das perspectivas
-                self.agent.terminal.log(f"Synthesis failed: {str(synthesis_error)}", "WARNING")
                 
-                # Combinar análises de forma estruturada
-                combined_analysis = {
+                # Parar o spinner do Deep Reasoning
+                self.agent.terminal.stop_processing()
+                
+                # Adicionar a síntese ao histórico do chat
+                self.agent.chat.history.append({
+                    "role": "assistant",
+                    "parts": [synthesis_result["message"]]
+                })
+                
+                # Retornar apenas a análise para o agente decidir o próximo passo
+                return {
                     "type": "analysis",
-                    "message": "Baseado na análise de múltiplas perspectivas:\n\n" + 
-                              "\n\n".join([
-                                  f"Da perspectiva {p['perspective']}:\n{p['analysis']}"
-                                  for p in perspectives_results
-                              ]),
+                    "message": synthesis_result["message"],
                     "requires_deep_reasoning": False,
                     "continue": True
                 }
                 
-                synthesis_result = combined_analysis
-                synthesis_response = None
-            
-            # Log da síntese antes do processamento
-            self.agent.terminal._save_interaction_to_file({
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "type": "DEEP_REASONING_SYNTHESIS",
-                "content": synthesis_result,
-                "raw_synthesis": synthesis_response
-            })
-            
-            try:
-                # Garantir que a síntese está no formato JSON correto
-                if isinstance(synthesis_result, str):
-                    synthesis_result = {
-                        "type": "analysis",
-                        "message": synthesis_result,
-                        "requires_deep_reasoning": False,
-                        "continue": True
-                    }
-                
-                # Adicionar síntese ao contexto
-                self.agent.context_manager.add_to_context({
-                    "timestamp": datetime.now().strftime("%H:%M:%S"),
-                    "type": "SYNTHESIS",
-                    "content": synthesis_result.get("message", "")[:200] + "..."  # Primeiros 200 caracteres
-                })
-                
-                return synthesis_result
-                
             except Exception as e:
-                self.agent.terminal._save_interaction_to_file({
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "type": "DEEP_REASONING_ERROR",
-                    "error": str(e),
-                    "synthesis_result": synthesis_result
-                })
-                raise e
-            
+                error_msg = f"Deep Reasoning failed: {str(e)}"
+                self.agent.terminal.log(error_msg, "ERROR")
+                
+                return {
+                    "type": "response",
+                    "message": "Deep analysis failed. Please proceed with standard analysis.",
+                    "requires_deep_reasoning": False,
+                    "continue": True
+                }
+                
         except Exception as e:
             self.agent.terminal.log(f"Deep Reasoning failed: {str(e)}", "ERROR")
-            return {"type": "error", "message": str(e)}
+            return {
+                "type": "response",
+                "message": str(e),
+                "requires_deep_reasoning": False,
+                "continue": True
+            }
     
     def _temp_configure_model(self, config: Dict) -> Dict:
         """
@@ -263,15 +235,20 @@ class DeepReasoning:
         raise ValueError("No valid JSON found in response")
     
     async def _synthesize_perspectives(self, perspectives_results: List[Dict], situation: str, context: str, language: str) -> Dict:
-        """Synthesizes different perspectives into a final analysis"""
+        """
+        Synthesizes different perspectives into a final analysis with streaming
+        """
         synthesis_prompt = self._create_synthesis_prompt(
             perspectives_results, 
             situation,
-            context,  # Passar contexto do chat
+            context,
             language
         )
         
         try:
+            # Stop the spinner before starting synthesis
+            self.agent.terminal.stop_processing()
+            
             # Use shared rate limiter
             await self.rate_limiter.wait_if_needed_async()
             
@@ -283,39 +260,83 @@ class DeepReasoning:
             
             full_response = ""
             buffer = ""
+            last_char = " "
             
             for chunk in response:
-                if hasattr(chunk, 'text') and chunk.text:
-                    text = chunk.text
-                    full_response += text
-                    buffer += text
-                    
-                    # Quando tiver texto suficiente ou encontrar pontuação
-                    if len(buffer) > 50 or any(p in buffer for p in ['.', '!', '?', '\n']):
-                        self.agent.terminal.log(buffer, "DIM", show_timestamp=False)
-                        buffer = ""
-                        await asyncio.sleep(0.01)
+                if hasattr(chunk, 'parts') and chunk.parts:
+                    for part in chunk.parts:
+                        if hasattr(part, 'text'):
+                            text = str(part.text)
+                            
+                            # Ignorar qualquer coisa que pareça JSON
+                            if text.strip().startswith('{') or text.strip().startswith('```'):
+                                continue
+                            
+                            text = text.replace('\r', '')
+                            
+                            # Remove duplicate content
+                            if text in full_response:
+                                continue
+                            
+                            full_response += text
+                            
+                            # Process text character by character
+                            for char in text:
+                                buffer += char
+                                
+                                # Print character by character with different delays
+                                if char in ['.', '!', '?']:
+                                    self.agent.terminal.console.print(buffer, style="dim", end="")
+                                    buffer = ""
+                                    await asyncio.sleep(0.1)
+                                elif char in [',', ';', ':']:
+                                    self.agent.terminal.console.print(buffer, style="dim", end="")
+                                    buffer = ""
+                                    await asyncio.sleep(0.05)
+                                elif char == '\n':
+                                    if buffer.strip():
+                                        self.agent.terminal.console.print(buffer, style="dim")
+                                        buffer = ""
+                                    await asyncio.sleep(0.02)
+                                elif len(buffer) > 2:
+                                    self.agent.terminal.console.print(buffer, style="dim", end="")
+                                    buffer = ""
+                                    await asyncio.sleep(0.01)
+                                
+                                last_char = char
             
-            # Imprimir qualquer texto restante
+            # Print any remaining text
             if buffer:
-                self.agent.terminal.log(buffer, "DIM", show_timestamp=False)
+                self.agent.terminal.console.print(buffer, style="dim")
             
+            # Add final line break
+            self.agent.terminal.console.print()
+            
+            # Limpar o texto final de qualquer JSON ou marcações
+            clean_response = re.sub(r'```.*?```', '', full_response, flags=re.DOTALL)
+            clean_response = re.sub(r'\{.*?\}', '', clean_response, flags=re.DOTALL)
+            clean_response = clean_response.strip()
+            
+            # Parar o spinner do Deep Reasoning
+            self.agent.terminal.stop_processing()
+            
+            # Retornar a análise para o agente continuar
             return {
                 "type": "analysis",
-                "analysis": full_response,
-                "next_step": None
+                "message": clean_response,
+                "requires_deep_reasoning": False,
+                "continue": True
             }
             
         except Exception as e:
             error_msg = f"\nError in synthesis: {str(e)}"
             self.agent.terminal.log(error_msg, "ERROR")
             
-            error_response = "Based on the deep analysis performed, please evaluate the results and determine the next action."
-            
             return {
                 "type": "response",
-                "message": error_response,
-                "next_step": None
+                "message": "Deep analysis failed. Please proceed with standard analysis.",
+                "requires_deep_reasoning": False,
+                "continue": True
             }
     
     def _create_synthesis_prompt(self, perspectives_results: List[Dict], situation: str, context: str, language: str) -> str:

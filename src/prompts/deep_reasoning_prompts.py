@@ -28,20 +28,14 @@ Recent conversation context:
 Previous analyses:
 {perspectives}
 
-Let me process this information...
+Think through each point carefully and provide a clear, direct analysis. Focus on:
+1. Most critical findings
+2. Greatest risks identified
+3. Most urgent defensive measures
+4. Specific actions needed
+5. Best approach to address this
 
-Consider:
-1. What are the most critical findings?
-2. What vulnerabilities pose the greatest risk?
-3. What defensive measures are most urgent?
-4. What specific actions need to be taken?
-5. What's the best approach to address this?
-
-Think through each point carefully.
-Focus on forming a complete understanding.
-Develop a clear action plan.
-
-Important: Think in {language}."""
+Important: Provide your analysis in plain text, not JSON format. Think in {language}."""
 
 def _format_perspectives(self, perspectives_results: List[Dict]) -> str:
     """
