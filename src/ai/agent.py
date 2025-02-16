@@ -133,6 +133,8 @@ class AIAgent:
         
         self.current_task: Optional[asyncio.Task] = None
         self.terminal.set_interrupt_handler(self.handle_interrupt)
+        self.max_recursion_depth = config.get('agent', {}).get('max_recursion_depth', 5)
+        self._analysis_in_progress = False  # Novo flag para controlar análises
         
     def _initialize_chat(self):
         genai.configure(api_key=self.config['api_key'])
@@ -211,29 +213,20 @@ class AIAgent:
             
     async def execute_step(self, parsed_response, context_info: str = None):
         try:
-            # Check if deep reasoning is needed
-            should_activate = parsed_response.get("requires_deep_reasoning", False)
-            
-            # Se já estiver em deep reasoning, não ativar novamente
-            if hasattr(self, '_in_deep_reasoning'):
-                should_activate = False
+            should_activate = (
+                parsed_response.get("requires_deep_reasoning", False) and 
+                not self._analysis_in_progress and
+                not parsed_response.get("type") == "analysis"
+            )
             
             if should_activate:
-                # Marcar que está em deep reasoning
-                self._in_deep_reasoning = True
-                
+                self._analysis_in_progress = True
                 try:
-                    # Passar o contexto_info diretamente para deep_analyze
                     deep_analysis = await self.deep_reasoning.deep_analyze(
                         context_info or "Current situation analysis",
-                        ""  # Não precisa passar contexto, será obtido do chat.history
+                        ""
                     )
                     
-                    # Limpar flag após análise
-                    if hasattr(self, '_in_deep_reasoning'):
-                        delattr(self, '_in_deep_reasoning')
-                    
-                    # Processar a resposta do deep_analysis
                     if isinstance(deep_analysis, dict):
                         # Adicionar a síntese ao histórico
                         self.chat.history.append({
@@ -241,78 +234,62 @@ class AIAgent:
                             "parts": [deep_analysis["message"]]
                         })
                         
-                        # Enviar análise para o modelo principal
+                        # Modificar o prompt para encorajar ação específica
                         analysis_prompt = f"""System: {self.system_prompt}
-                        
-                        A deep analysis has been performed. Based on this analysis, determine the best action to take:
 
-                        Deep Reasoning Analysis:
+                        Based on this deep analysis:
                         {deep_analysis["message"]}
 
-                        IMPORTANT: Do not include any commands in your response. Just analyze the situation and provide guidance.
-                        Please respond in the specified JSON format with type: "analysis" and continue: true."""
+                        Determine the immediate next action to take. If appropriate, include a specific command to execute.
+                        Remember to follow the required JSON format and include next_step if a command is needed."""
                         
-                        # Obter resposta do modelo
                         response = self.model.generate_content(analysis_prompt)
                         
                         if hasattr(response, 'parts') and response.parts:
                             try:
-                                # Processar resposta
                                 response_text = response.parts[0].text
+                                json_str = _extract_json(response_text)
+                                second_parsed = json.loads(json_str)
                                 
-                                # Não mostrar o JSON no terminal
-                                clean_text = re.sub(r'```json.*?```', '', response_text, flags=re.DOTALL)
-                                clean_text = re.sub(r'\{.*?\}', '', clean_text, flags=re.DOTALL)
+                                # Garantir que a resposta mantenha o fluxo
+                                if isinstance(second_parsed, dict):
+                                    second_parsed.update({
+                                        "type": "analysis" if not second_parsed.get("next_step") else "command",
+                                        "requires_deep_reasoning": False,
+                                        "continue": True
+                                    })
                                 
-                                if clean_text.strip():
-                                    self.terminal.log_agent(clean_text.strip())
-                                
-                                # Retornar para continuar o fluxo normal
-                                return deep_analysis["message"], True
-                                
+                                return second_parsed, True
                             except Exception as e:
-                                self.terminal.log(f"Error processing model response: {str(e)}", "ERROR")
-                        
-                        # Fallback: continuar com a análise original
-                        return deep_analysis["message"], True
+                                self.terminal.log(f"Error parsing analysis response: {str(e)}", "ERROR")
+                                return deep_analysis, True
                     
-                    return str(deep_analysis), False
+                    return deep_analysis, True
                     
-                except Exception as e:
-                    # Limpar flag em caso de erro
-                    if hasattr(self, '_in_deep_reasoning'):
-                        delattr(self, '_in_deep_reasoning')
-                        
-                    error_msg = f"Deep Reasoning failed: {str(e)}"
-                    self.terminal.log(error_msg, "ERROR")
-                    return error_msg, False
+                finally:
+                    self._analysis_in_progress = False
             
             # Execute command if present
             if parsed_response.get("next_step"):
                 action = parsed_response["next_step"]
                 if action.get("command"):
-                    # Verificar confirmação antes de qualquer log
                     if self._needs_confirmation(action.get("risk", "low")):
                         if not await self.terminal.request_confirmation(
                             f"Execute command '{action['command']}'? This action has {action.get('risk', 'unknown')} risk."
                         ):
                             return "Command cancelled by user", False
                     
-                    # Executar comando
                     output, returncode = self.linux.run_command(action['command'])
-                    
-                    # Log do comando e output
                     self.terminal.log_command(action['command'], output, returncode)
                     
-                    # Se o comando falhou, retornar erro
                     if returncode != 0:
                         return f"Command failed with code {returncode}: {output}", False
                     
-                    # Processar output do comando
-                    return output, parsed_response.get("continue", False)
+                    # Retornar parsed_response em vez do output para manter o fluxo
+                    return parsed_response, parsed_response.get("continue", False)
             
-            # Se não tiver next_step, retornar apenas a mensagem
-            return parsed_response.get("message", ""), parsed_response.get("continue", False)
+            # Se não tiver next_step, manter o continue do parsed_response
+            return parsed_response, parsed_response.get("continue", False)
             
         except Exception as e:
             self.terminal.log(f"Error in execute_step: {str(e)}", "ERROR")
@@ -363,84 +340,66 @@ class AIAgent:
             
             self.terminal.stop_processing()
             
-            async def process_response(response_text: str):
+            async def process_response(response_text: str, depth: int = 0):
                 try:
-                    # Se a resposta já for um objeto JSON
+                    # Verificar profundidade máxima de recursão
+                    if depth >= self.max_recursion_depth:
+                        self.terminal.log("Maximum recursion depth reached", "WARNING")
+                        return "Maximum recursion depth reached"
+
+                    # Parsing do JSON e inicialização
                     if isinstance(response_text, dict):
                         parsed = response_text
+                        json_str = json.dumps(response_text)
                     else:
-                        # Inicializar variáveis fora do bloco try
-                        clean_text = ""
-                        json_str = ""
-                        
                         try:
                             clean_text = re.sub(r"```json\s*([\s\S]*?)```", r"\1", response_text)
                             json_str = _extract_json(clean_text)
                             parsed = json.loads(json_str)
                         except Exception as e:
-                            # Se falhar ao extrair JSON, tentar usar a resposta como mensagem simples
-                            return {
+                            json_str = json.dumps({
                                 "type": "response",
                                 "message": str(response_text),
                                 "requires_deep_reasoning": False,
                                 "continue": False
-                            }
-                    
-                    # Log do parsing inicial
+                            })
+                            parsed = json.loads(json_str)
+
+                    # Log do parsing
                     self.terminal._save_interaction_to_file({
                         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "type": "RESPONSE_PARSE_DEBUG",
-                        "cleaned_text": clean_text,
-                        "extracted_json": json_str,
                         "parsed_result": parsed
                     })
-                    
-                    # Verificar se já processamos esta resposta
-                    if isinstance(response_text, str):
-                        response_hash = hash(response_text)
-                    else:
-                        response_hash = hash(str(response_text))
-                        
-                    if hasattr(self, '_last_response_hash') and self._last_response_hash == response_hash:
-                        return "Response already processed"
-                    self._last_response_hash = response_hash
-                    
-                    # Exibir mensagem do agente se existir
-                    if parsed.get("message"):
-                        self.terminal.log_agent(parsed["message"])
-                    
-                    # Passar user_input como contexto
+
+                    # Processar mensagem apenas uma vez e se não for output direto de comando
+                    if parsed.get("message") and not parsed.get("_processed"):
+                        parsed["_processed"] = True
+                        if not (parsed.get("next_step") and not parsed.get("type") == "analysis"):
+                            self.terminal.log_agent(parsed["message"])
+
+                    # Executar próximo passo
                     result, should_continue = await self.execute_step(parsed, user_input)
-                    
-                    # Limpar hash se não precisar continuar
-                    if not should_continue:
-                        delattr(self, '_last_response_hash')
-                        return result
-                    
-                    # Se precisar continuar e tiver resultado
-                    if should_continue and parsed.get("continue", False):
-                        # Se o resultado já for um objeto JSON
+
+                    # Se deve continuar e não atingiu profundidade máxima
+                    if should_continue and depth < self.max_recursion_depth:
                         if isinstance(result, dict):
-                            return await process_response(result)
-                        # Se for string, tentar processar como JSON
-                        try:
-                            return await process_response(result)
-                        except:
-                            # Se falhar, apenas retornar erro em formato JSON
-                            return {
-                                "type": "response",
-                                "message": f"Error processing response: {str(result)}",
-                                "requires_deep_reasoning": False,
-                                "continue": False
-                            }
-                    
-                    return result
-                    
+                            # Limpar flags de processamento para permitir nova análise
+                            if "_processed" in result:
+                                del result["_processed"]
+                            return await process_response(result, depth + 1)
+                
+                    # Retornar resultado final
+                    if isinstance(result, dict):
+                        return result.get("message", "")
+                    return str(result)
+
                 except Exception as e:
                     self.terminal.log(f"Error in process_response: {str(e)}", "ERROR")
                     return str(e)
 
-            final_result = await process_response(response_text)
+            # Iniciar processamento
+            final_result = await process_response(response_text, 0)
             return final_result.strip() if isinstance(final_result, str) else str(final_result)
 
         except asyncio.CancelledError:

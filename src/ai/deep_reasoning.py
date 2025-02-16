@@ -263,47 +263,31 @@ class DeepReasoning:
             last_char = " "
             
             for chunk in response:
-                if hasattr(chunk, 'parts') and chunk.parts:
-                    for part in chunk.parts:
-                        if hasattr(part, 'text'):
-                            text = str(part.text)
-                            
-                            # Ignorar qualquer coisa que pareça JSON
-                            if text.strip().startswith('{') or text.strip().startswith('```'):
-                                continue
-                            
-                            text = text.replace('\r', '')
-                            
-                            # Remove duplicate content
-                            if text in full_response:
-                                continue
-                            
-                            full_response += text
-                            
-                            # Process text character by character
-                            for char in text:
-                                buffer += char
-                                
-                                # Print character by character with different delays
-                                if char in ['.', '!', '?']:
-                                    self.agent.terminal.console.print(buffer, style="dim", end="")
-                                    buffer = ""
-                                    await asyncio.sleep(0.1)
-                                elif char in [',', ';', ':']:
-                                    self.agent.terminal.console.print(buffer, style="dim", end="")
-                                    buffer = ""
-                                    await asyncio.sleep(0.05)
-                                elif char == '\n':
-                                    if buffer.strip():
-                                        self.agent.terminal.console.print(buffer, style="dim")
-                                        buffer = ""
-                                    await asyncio.sleep(0.02)
-                                elif len(buffer) > 2:
-                                    self.agent.terminal.console.print(buffer, style="dim", end="")
-                                    buffer = ""
-                                    await asyncio.sleep(0.01)
-                                
-                                last_char = char
+                text = getattr(chunk, 'text', "")
+                full_response += text  # Acumular todo o texto para limpeza
+                for char in text:
+                    buffer += char
+                    
+                    # Print character by character with different delays
+                    if char in ['.', '!', '?']:
+                        self.agent.terminal.console.print(buffer, style="dim", end="")
+                        buffer = ""
+                        await asyncio.sleep(0.1)
+                    elif char in [',', ';', ':']:
+                        self.agent.terminal.console.print(buffer, style="dim", end="")
+                        buffer = ""
+                        await asyncio.sleep(0.05)
+                    elif char == '\n':
+                        if buffer.strip():
+                            self.agent.terminal.console.print(buffer, style="dim")
+                            buffer = ""
+                        await asyncio.sleep(0.02)
+                    elif len(buffer) > 2:
+                        self.agent.terminal.console.print(buffer, style="dim", end="")
+                        buffer = ""
+                        await asyncio.sleep(0.01)
+                    
+                    last_char = char
             
             # Print any remaining text
             if buffer:
@@ -312,15 +296,16 @@ class DeepReasoning:
             # Add final line break
             self.agent.terminal.console.print()
             
-            # Limpar o texto final de qualquer JSON ou marcações
-            clean_response = re.sub(r'```.*?```', '', full_response, flags=re.DOTALL)
-            clean_response = re.sub(r'\{.*?\}', '', clean_response, flags=re.DOTALL)
+            # Limpar JSON e blocos de código do texto final
+            clean_response = re.sub(r'```json\s*([\s\S]*?)```', '', full_response, flags=re.DOTALL)
+            clean_response = re.sub(r'```[\s\S]*?```', '', clean_response, flags=re.DOTALL)
             clean_response = clean_response.strip()
+
+            # Remover trecho que contenha chaves JSON, se necessário
+            clean_response = re.sub(r'\{[\s\S]*?\}', '', clean_response, flags=re.DOTALL).strip()
             
-            # Parar o spinner do Deep Reasoning
-            self.agent.terminal.stop_processing()
-            
-            # Retornar a análise para o agente continuar
+            # Não adicionar diretamente no chat.history,
+            # apenas retornar para que o agente gerencie o fluxo.
             return {
                 "type": "analysis",
                 "message": clean_response,
