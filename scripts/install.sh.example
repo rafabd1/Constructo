@@ -1,0 +1,6 @@
+#!/bin/bash
+# Example installation script for Constructo (Linux/macOS)
+
+echo "Constructo installation script (Example)"
+
+# Add installation steps here (e.g., download binary, set permissions, add to PATH) 

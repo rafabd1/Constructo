@@ -1,0 +1,14 @@
+# Example configuration for Constructo
+llm:
+  provider: openai # Example: openai, anthropic, etc.
+  api_key: "YOUR_API_KEY"
+
+memory:
+  path: "~/.constructo/memory"
+
+judge:
+  enabled: true
+  trigger_threshold: 10 # Example: trigger after 10 actions
+
+terminal:
+  shell: "auto" # auto-detect or specify (e.g., bash, powershell) 
