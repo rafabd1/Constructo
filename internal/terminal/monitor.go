@@ -4,20 +4,23 @@ import (
 	"fmt"
 	"io"
 	"sync"
+
+	// Import the correct pty package
+	pty "github.com/aymanbagabas/go-pty"
 )
 
 // Monitor reads from a Pty output and distributes it.
 type Monitor struct {
-	pty    Pty       // The pseudo-terminal to monitor
-	output io.Writer // Where to write the output (can be changed)
+	pty    pty.Pty     // Use the interface from the library directly
+	output io.Writer   // Where to write the output (can be changed)
 	mu     sync.Mutex
 	done   chan struct{} // Channel to signal stopping
 }
 
 // NewMonitor creates a new terminal monitor.
-func NewMonitor(pty Pty, output io.Writer) *Monitor {
+func NewMonitor(p pty.Pty, output io.Writer) *Monitor {
 	return &Monitor{
-		pty:    pty,
+		pty:    p,
 		output: output,
 		done:   make(chan struct{}),
 	}
@@ -49,7 +52,7 @@ func (m *Monitor) run() {
 		case <-m.done:
 			return // Stop requested
 		default:
-			n, err := m.pty.Read(buf) // Read from PTY
+			n, err := m.pty.Read(buf) // Read directly from the pty.Pty interface
 			if n > 0 {
 				m.mu.Lock() // Lock before accessing/writing to output
 				output := m.output
