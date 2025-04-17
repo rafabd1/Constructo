@@ -10,12 +10,29 @@ import (
 
 	"github.com/rafabd1/Constructo/internal/agent"
 	"github.com/rafabd1/Constructo/internal/commands"
+	"github.com/rafabd1/Constructo/internal/config"
 	// TODO: Import other command packages if they are separate
 )
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// 0. Load Configuration
+	cfg, err := config.Load() 
+	if err != nil {
+		log.Fatalf("Failed to load configuration: %v", err)
+	}
+	// Validate mandatory config (e.g., API Key if not using ADC)
+	if cfg.LLM.APIKey == "" {
+		// Depending on auth strategy, this might be a fatal error
+		// Or just a warning if ADC is expected to work.
+		log.Println("Warning: llm.api_key is not set in config. Attempting ADC.")
+		// Optionally, check if project_id/location are set for ADC
+		// if cfg.LLM.ProjectID == "" || cfg.LLM.Location == "" {
+		// 	log.Fatalf("Fatal: llm.api_key is missing and llm.project_id/llm.location are not set for ADC.")
+		// }
+	}
 
 	// 1. Create Command Registry
 	registry := commands.NewRegistry()
@@ -46,8 +63,8 @@ func main() {
 	// Make HelpCmd aware of all commands *after* they are registered
 	// helpCmd.Initialize() // Or pass registry later if needed
 
-	// 3. Create Agent (passing registry)
-	constructoAgent, err := agent.NewAgent(ctx, registry)
+	// 3. Create Agent (passing config and registry)
+	constructoAgent, err := agent.NewAgent(ctx, cfg, registry)
 	if err != nil {
 		log.Fatalf("Failed to create agent: %v", err)
 	}

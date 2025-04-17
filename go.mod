@@ -11,6 +11,7 @@ require (
 	github.com/aymanbagabas/go-pty v0.2.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/u-root/u-root v0.11.0 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
 require (

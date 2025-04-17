@@ -1,14 +1,27 @@
 # Example configuration for Constructo
+
 llm:
-  provider: openai # Example: openai, anthropic, etc.
-  api_key: "YOUR_API_KEY"
+  # Gemini API Key (Recommended). Get from Google AI Studio.
+  # If commented out or empty, the agent will attempt to use Application Default Credentials (ADC).
+  # See: https://cloud.google.com/docs/authentication/provide-credentials-adc
+  api_key: "YOUR_GEMINI_API_KEY" 
 
-memory:
-  path: "~/.constructo/memory"
-
-judge:
-  enabled: true
-  trigger_threshold: 10 # Example: trigger after 10 actions
+  # Model name to use (e.g., gemini-1.5-flash, gemini-1.5-pro)
+  model_name: "gemini-1.5-flash"
 
 terminal:
-  shell: "auto" # auto-detect or specify (e.g., bash, powershell) 
+  # Optional: Specify a default shell executable path.
+  # If commented out or empty, the agent attempts to detect the default system shell.
+  # default_shell: "/bin/bash" # Example for Linux/macOS
+  # default_shell: "powershell.exe" # Example for Windows
+
+log:
+  # Optional: Set log level (e.g., debug, info, warn, error)
+  # level: "info"
+
+# memory:
+#   path: "~/.constructo/memory" # Example for future memory system
+
+# judge:
+#   enabled: true
+#   trigger_threshold: 10 

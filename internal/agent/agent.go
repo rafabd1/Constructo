@@ -16,11 +16,10 @@ import (
 	"github.com/google/generative-ai-go/genai"
 	"github.com/pkg/errors"
 	"github.com/rafabd1/Constructo/internal/commands"
+	"github.com/rafabd1/Constructo/internal/config"
 	"github.com/rafabd1/Constructo/internal/terminal"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
-	// Placeholder for other imports
-	// "github.com/rafabd1/Constructo/internal/config"
 )
 
 const (
@@ -67,30 +66,37 @@ type Agent struct {
 	lastUserInput string
 }
 
-// NewAgent creates a new agent instance.
-func NewAgent(ctx context.Context, registry *commands.Registry) (*Agent, error) {
+// NewAgent creates a new agent instance based on the provided configuration.
+func NewAgent(ctx context.Context, cfg *config.Config, registry *commands.Registry) (*Agent, error) {
 	// --- Load System Instruction ---
 	systemInstructionBytes, err := os.ReadFile("instructions/system_prompt.txt")
 	if err != nil {
 		log.Printf("Warning: Could not read system instructions file 'instructions/system_prompt.txt': %v. Proceeding without system instructions.", err)
-		// Continue without system instructions, or return error if it's critical
-		// return nil, fmt.Errorf("failed to load system instructions: %w", err)
 	}
 	systemInstruction := string(systemInstructionBytes)
 
-	// --- Initialize Gemini Client using API Key ---
-	apiKey := "x" // TODO: Load from config or env more securely
-	if apiKey == "" {
-		return nil, fmt.Errorf("API Key not found. Please set the API_KEY environment variable or configuration")
-	}
+	// --- Initialize Gemini Client using Config ---
+	apiKey := cfg.LLM.APIKey
+	modelName := cfg.LLM.ModelName
 
-	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create genai client: %w", err)
+	var client *genai.Client
+
+	if apiKey != "" {
+		log.Println("Initializing Gemini client with API Key from config.")
+		client, err = genai.NewClient(ctx, option.WithAPIKey(apiKey))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create genai client with API key: %w", err)
+		}
+	} else {
+		log.Println("API Key not found in config. Attempting to use default credentials (ADC).")
+		client, err = genai.NewClient(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create genai client with default credentials: %w", err)
+		}
 	}
 
 	// --- Configure Model ---
-	model := client.GenerativeModel(geminiModelName)
+	model := client.GenerativeModel(modelName)
 	if systemInstruction != "" {
 		model.SystemInstruction = &genai.Content{
 			Parts: []genai.Part{genai.Text(systemInstruction)},
@@ -98,24 +104,13 @@ func NewAgent(ctx context.Context, registry *commands.Registry) (*Agent, error) 
 		log.Println("System instruction loaded successfully.")
 	}
 	
-	// >>> RE-ENABLE FUNCTION CALLING <<<
-	model.Tools = []*genai.Tool{{ 
-		FunctionDeclarations: []*genai.FunctionDeclaration{{
-			Name:        "agent_action",
-			Description: "Specify the next action for the agent: a message, a command, or a signal.",
-			Parameters:  agentResponseSchema,
-		}},
-	}}
-	model.ToolConfig = &genai.ToolConfig{
-		FunctionCallingConfig: &genai.FunctionCallingConfig{
-			// Mode defaults to Auto
-			// AllowedFunctionNames: []string{"agent_action"}, // Keep removed for now
-		},
-	}
+	// Configure for Direct JSON Output
+	model.ResponseMIMEType = "application/json"
+	model.ResponseSchema = agentResponseSchema 
+	log.Println("Model configured for direct JSON output.")
 
 	// --- Start Chat Session ---
 	cs := model.StartChat()
-	// TODO: Load initial history if available
 
 	// --- Create Agent Instance ---
 	return &Agent{
@@ -177,12 +172,16 @@ func (a *Agent) Run(ctx context.Context) error {
 			return nil
 
 		case line := <-a.userInputChan:
-			fmt.Printf("[Debug] Received line from userInputChan: %q\n", line)
+			// fmt.Printf("[Debug] Received line from userInputChan: %q\n", line)
 			if a.handleUserInput(ctx, line) {
 				// User input handled internally or triggered agent turn
 			} else {
-				// >>> TEMPORARILY DISABLED FOR DEBUGGING HANG <<<
-				fmt.Println("[Debug] Direct write to terminal disabled for hang test.")
+				// Re-enable direct write for non-command input
+				_, err := a.termController.Write([]byte(line + "\n"))
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error writing to terminal: %v\n", err)
+				}
+				// fmt.Println("[Debug] Direct write to terminal disabled for hang test.") // Removed
 			}
 
 		case <-a.getOutputTimerChannel(): // Debounced output trigger
@@ -223,7 +222,7 @@ func (a *Agent) readUserInput() {
 		}
 		line = strings.TrimSpace(line)
 		if line != "" {
-			fmt.Printf("[Debug] readUserInput sending line: %q\n", line)
+			// fmt.Printf("[Debug] readUserInput sending line: %q\n", line)
 			select {
 			case a.userInputChan <- line:
 			case <-a.stopChan:
@@ -236,7 +235,7 @@ func (a *Agent) readUserInput() {
 // handleUserInput checks for internal commands or prepares for LLM.
 // Returns true if the input was handled internally or triggers an agent turn.
 func (a *Agent) handleUserInput(ctx context.Context, line string) bool {
-	fmt.Printf("[Debug] handleUserInput called with line: %q\n", line)
+	// fmt.Printf("[Debug] handleUserInput called with line: %q\n", line)
 	if strings.HasPrefix(line, "/") {
 		parts := strings.Fields(line)
 		commandName := strings.TrimPrefix(parts[0], "/")
@@ -256,13 +255,13 @@ func (a *Agent) handleUserInput(ctx context.Context, line string) bool {
 		return true // Command execution handled
 	}
 
-	// Store user input and trigger LLM processing
-	fmt.Println("[Debug] handleUserInput triggering processAgentTurn for normal input.")
+	// Regular user input: always trigger agent turn
+	// fmt.Println("[Debug] handleUserInput triggering processAgentTurn for normal input.") // Removed debug log
 	a.mu.Lock()
 	a.lastUserInput = line
 	a.mu.Unlock()
 	a.processAgentTurn(ctx, "user_input")
-	return true
+	return true // Agent turn was triggered
 }
 
 // handleTerminalOutput is called by SynchronizedBufferWriter when new output arrives.
@@ -322,9 +321,10 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string) {
 
 	fmt.Printf("[Agent Turn Triggered by: %s]\n", trigger)
 
-	// Remove confusing debug log that printed the whole buffer
-	// if terminalOutput != "" {
-	// 	fmt.Printf("[Debug] Terminal Output Cleared:\n%s\n[/Debug Output Cleared]\n", terminalOutput)
+	// Don't skip agent turn if buffer is empty, maybe user input triggered it
+	// if terminalOutput == "" && trigger != "user_input" {
+	// 	fmt.Println("[Debug] Skipping agent turn: No new terminal output and not user input.")
+	// 	return
 	// }
 
 	// 2. Construct LLM Message Part(s)
@@ -365,7 +365,7 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string) {
 		return
 	}
 
-	// 4. Parse LLM Response (extract function call)
+	// 4. Parse LLM Response (expect direct JSON in Text part)
 	var agentResp AgentResponse
 	processed := false
 
@@ -373,48 +373,35 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string) {
 		log.Println("Warning: Received nil response from LLM.")
 	} else if len(resp.Candidates) == 0 {
 		log.Println("Warning: Received response with no candidates from LLM.")
-		// Log finish reason if available even with no candidates
 		if resp.PromptFeedback != nil {
 			log.Printf("Prompt Feedback: BlockReason=%v, SafetyRatings=%+v", resp.PromptFeedback.BlockReason, resp.PromptFeedback.SafetyRatings)
 		}
 	} else if resp.Candidates[0].Content == nil {
 		log.Println("Warning: Received candidate with nil content from LLM.")
-		// Log finish reason and safety ratings for the candidate
 		candidate := resp.Candidates[0]
 		log.Printf("Candidate FinishReason: %v, SafetyRatings: %+v, CitationMetadata: %+v",
 			candidate.FinishReason, candidate.SafetyRatings, candidate.CitationMetadata)
 	} else if len(resp.Candidates[0].Content.Parts) == 0 {
 		log.Println("Warning: Received candidate content with no parts from LLM.")
-		// Log finish reason and safety ratings for the candidate
 		candidate := resp.Candidates[0]
 		log.Printf("Candidate FinishReason: %v, SafetyRatings: %+v, CitationMetadata: %+v",
 			candidate.FinishReason, candidate.SafetyRatings, candidate.CitationMetadata)
 	} else {
+		// Expect the JSON content directly in the first Text part
 		part := resp.Candidates[0].Content.Parts[0]
-		if fc, ok := part.(genai.FunctionCall); ok {
-			if fc.Name == "agent_action" {
-				if fc.Args == nil {
-					log.Println("Warning: Received agent_action function call with nil arguments.")
-				} else {
-					jsonData, err := json.Marshal(fc.Args)
-					if err != nil {
-						log.Printf("Error marshaling function call args: %v", err)
-					} else {
-						if err := json.Unmarshal(jsonData, &agentResp); err != nil {
-							log.Printf("Error unmarshaling agent response JSON: %v", err)
-						} else {
-							processed = true
-							fmt.Printf("[LLM Response Parsed: %+v]\n", agentResp)
-						}
-					}
-				}
+		if txt, ok := part.(genai.Text); ok {
+			jsonData := []byte(txt)
+			if err := json.Unmarshal(jsonData, &agentResp); err != nil {
+				log.Printf("Error unmarshaling direct JSON response: %v\nJSON received: %s", err, string(jsonData))
+			} else {
+				processed = true
+				fmt.Printf("[LLM JSON Response Parsed: %+v]\n", agentResp)
 			}
-		} else if txt, ok := part.(genai.Text); ok {
-			agentResp.Msg = string(txt)
-			processed = true
-			fmt.Printf("[LLM Text Response: %s]\n", agentResp.Msg)
+		} else {
+			log.Printf("Warning: Expected genai.Text part for JSON response, but got %T", part)
 		}
 	}
+	// --- END RESPONSE PROCESSING --- 
 
 	if !processed {
 		log.Println("Warning: Could not process LLM response content.")
