@@ -38,8 +38,24 @@ Constructo is an advanced AI terminal agent designed for versatility and deep sy
     docker build -t constructo-agent .
 
     # Run the agent interactively in the container
-    # Make sure config.yaml is in the project root directory when building
-    docker run -it --rm --name constructo constructo-agent
+    # This mounts your local config.yaml into the container.
+    # Ensure config.yaml is in the project root when running this.
+    # Use the command appropriate for your shell:
+    
+    # Linux/macOS/WSL/Git Bash:
+    docker run -it --rm --name constructo \
+      -v "$(pwd)/config.yaml:/app/config.yaml:ro" \
+      constructo-agent
+    
+    # PowerShell:
+    # docker run -it --rm --name constructo `
+    #  -v "${PWD}/config.yaml:/app/config.yaml:ro" `
+    #  constructo-agent
+
+    # Windows CMD:
+    # docker run -it --rm --name constructo ^
+    #  -v "%cd%/config.yaml:/app/config.yaml:ro" ^
+    #  constructo-agent
     ```
 
 4.  **Build and Run Locally (Requires Linux/macOS for reliable PTY):**

@@ -64,37 +64,58 @@ func (c *PtyController) SetOutput(output io.Writer) {
 }
 
 // Start initializes and starts the pseudo-terminal with the given shell command.
-// If shellCmd is empty, it attempts to use the default system shell.
 func (c *PtyController) Start(ctx context.Context, shellCmd string, args ...string) error {
 	c.mu.Lock()
-	// Capture output under lock before unlocking
 	currentOutput := c.output
-	// Unlock early to avoid holding lock during pty.Start
 	c.mu.Unlock()
 
-	// Re-lock for state check and modification (briefly)
 	c.mu.Lock()
 	if c.cmd != nil || c.ptyFile != nil {
 		c.mu.Unlock()
 		return fmt.Errorf("terminal controller already started")
 	}
-	c.mu.Unlock() // Unlock before potentially long-running operations
+	c.mu.Unlock()
 
-	// Determine shell command if not provided
-	if shellCmd == "" {
-		shellCmd = defaultShell() // defaultShell should prioritize /bin/bash or similar on Linux
-		if shellCmd == "" {
-			return fmt.Errorf("could not determine default shell (ensure /bin/bash or similar exists)")
+	// Determine shell command
+	var effectiveShell string
+	var effectiveArgs []string
+
+	if shellCmd != "" { // User explicitly provided a shell
+		effectiveShell = shellCmd
+		effectiveArgs = args
+		log.Printf("Using explicitly provided shell: %s %v", effectiveShell, effectiveArgs)
+	} else {
+		// Attempt to detect default shell, but prefer bash if available in container
+		detectedShell := defaultShell()
+		if _, err := exec.LookPath("bash"); err == nil {
+			effectiveShell = "bash" // Prefer bash if installed
+			log.Println("Defaulting to bash for PTY session.")
+		} else if detectedShell != "" {
+			effectiveShell = detectedShell
+			log.Printf("Defaulting to detected shell: %s", effectiveShell)
+		} else {
+			return fmt.Errorf("could not determine a suitable shell (bash not found and detection failed)")
+		}
+		
+		// Set effective args based on user input or default to a robust REPL implementation
+		if len(args) > 0 {
+		    effectiveArgs = args
+		} else {
+		    // Create a simple but robust REPL that works even in restricted PTY environments
+		    repl := `while true; do printf "> "; read -r cmd; [ -z "$cmd" ] && continue; eval "$cmd" || echo "Command exited with status $?"; done`
+		    effectiveArgs = []string{"-c", repl}
+		    log.Printf("Starting shell %s with custom REPL loop for stability.", effectiveShell)
 		}
 	}
 
 	// Create the command
-	cmd := exec.CommandContext(ctx, shellCmd, args...)
+	log.Printf("Starting PTY with command: %s %v", effectiveShell, effectiveArgs)
+	cmd := exec.CommandContext(ctx, effectiveShell, effectiveArgs...)
 
 	// Start the command within a PTY.
 	ptyF, err := pty.Start(cmd)
 	if err != nil {
-		return fmt.Errorf("failed to start pty: %w", err)
+		return fmt.Errorf("failed to start pty with shell '%s': %w", effectiveShell, err)
 	}
 
 	// Re-acquire lock to update controller state safely

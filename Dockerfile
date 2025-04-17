@@ -1,5 +1,5 @@
-# Use a standard Go image
-FROM golang:1.22-alpine AS builder
+# Use a standard Go image based on Debian Bookworm
+FROM golang:1.24-bookworm AS builder
 
 # Set the working directory inside the container
 WORKDIR /app
@@ -19,12 +19,15 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /constructo cmd/constructo/main.go
 
 # --- Final Stage ---
-# Use a minimal base image like alpine
-FROM alpine:latest
+# Use a minimal Debian base image
+FROM debian:bookworm-slim
 
-# Install necessary runtime dependencies (if any - bash is often useful)
-# For creack/pty, usually no extra OS libs are needed beyond standard libc
-RUN apk add --no-cache bash
+# Install necessary runtime dependencies (bash)
+# Use apt-get for Debian-based images
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends bash ca-certificates && \
+    update-ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
 # Copy the built binary from the builder stage
 COPY --from=builder /constructo /usr/local/bin/constructo

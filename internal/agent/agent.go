@@ -146,7 +146,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.termController.SetOutput(outputWriter) // Set output directly to our buffer writer
 
 	// 3. Start the terminal (using default shell for now)
-	if err := a.termController.Start(ctx, "", ""); err != nil {
+	if err := a.termController.Start(ctx, ""); err != nil {
 		return fmt.Errorf("failed to start terminal controller: %w", err)
 	}
 	defer a.termController.Stop()

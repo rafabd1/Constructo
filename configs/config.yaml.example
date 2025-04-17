@@ -1,9 +1,6 @@
 # Example configuration for Constructo
 
 llm:
-  # Gemini API Key (Recommended). Get from Google AI Studio.
-  # If commented out or empty, the agent will attempt to use Application Default Credentials (ADC).
-  # See: https://cloud.google.com/docs/authentication/provide-credentials-adc
   api_key: "YOUR_GEMINI_API_KEY" 
 
   # Model name to use (e.g., gemini-1.5-flash, gemini-1.5-pro)
