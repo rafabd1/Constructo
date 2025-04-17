@@ -4,51 +4,126 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/google/generative-ai-go/genai"
 	"github.com/rafabd1/Constructo/internal/commands"
 	"github.com/rafabd1/Constructo/internal/terminal"
-	// Placeholder for LLM client, parser, etc.
-	// "github.com/rafabd1/Constructo/pkg/llm"
+	"google.golang.org/api/option"
+	// Placeholder for other imports
 	// "github.com/rafabd1/Constructo/internal/config"
 )
 
 const (
 	outputDebounceDuration = 500 * time.Millisecond
 	periodicUpdateInterval = 1 * time.Minute
+	geminiModelName        = "gemini-1.5-flash"
 )
+
+// AgentResponse defines the expected JSON structure from the LLM.
+type AgentResponse struct {
+	Msg    string `json:"msg,omitempty"`    // Message to display to the user.
+	Cmd    string `json:"cmd,omitempty"`    // Command to execute in the terminal.
+	Signal string `json:"signal,omitempty"` // OS Signal to send (e.g., "SIGINT").
+}
+
+// Define the schema for the AgentResponse
+var agentResponseSchema = &genai.Schema{
+	Type: genai.TypeObject,
+	Properties: map[string]*genai.Schema{
+		"msg":    {Type: genai.TypeString, Description: "Message to display to the user."},
+		"cmd":    {Type: genai.TypeString, Description: "Command to execute in the terminal."},
+		"signal": {Type: genai.TypeString, Description: "OS Signal to send (e.g., 'SIGINT', 'SIGTERM')."},
+	},
+	// Optional: Specify required fields if needed
+	// Required: []string{"msg"}, // Example: msg is always required
+}
 
 // Agent manages the main interaction loop, terminal, and LLM communication.
 type Agent struct {
 	termController terminal.Controller
-	cmdRegistry    *commands.Registry // Assuming commands are registered elsewhere
-	// llmClient      llm.Client // Placeholder
-	// parser         Parser     // Placeholder for LLM response parser
+	cmdRegistry    *commands.Registry
+	genaiClient    *genai.Client
+	chatSession    *genai.ChatSession
 
-	userInputChan chan string      // Channel for user input lines
-	termOutputBuf *bytes.Buffer    // Buffer to capture terminal output for the agent
-	mu            sync.Mutex       // Protects agent state, especially termOutputBuf access
-	lastOutput    time.Time        // Time of last output received from terminal
-	outputTimer   *time.Timer      // Timer for debouncing output triggers
-	stopChan      chan struct{}    // Channel to signal agent shutdown
-	cancelContext context.CancelFunc // Context cancellation for background tasks
+	userInputChan chan string
+	termOutputBuf *bytes.Buffer
+	mu            sync.Mutex
+	lastOutput    time.Time
+	outputTimer   *time.Timer
+	stopChan      chan struct{}
+	cancelContext context.CancelFunc
+
+	// Store the last user input for context
+	lastUserInput string
 }
 
 // NewAgent creates a new agent instance.
-func NewAgent(registry *commands.Registry /* llmClient llm.Client, parser Parser */) *Agent {
+func NewAgent(ctx context.Context, registry *commands.Registry) (*Agent, error) {
+	// --- Load System Instruction ---
+	systemInstructionBytes, err := os.ReadFile("instructions/system_prompt.txt")
+	if err != nil {
+		log.Printf("Warning: Could not read system instructions file 'instructions/system_prompt.txt': %v. Proceeding without system instructions.", err)
+		// Continue without system instructions, or return error if it's critical
+		// return nil, fmt.Errorf("failed to load system instructions: %w", err)
+	}
+	systemInstruction := string(systemInstructionBytes)
+
+	// --- Initialize Gemini Client using API Key ---
+	apiKey := "x" // TODO: Load from config or env more securely
+	if apiKey == "" {
+		return nil, fmt.Errorf("API Key not found. Please set the API_KEY environment variable or configuration")
+	}
+
+	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create genai client: %w", err)
+	}
+
+	// --- Configure Model ---
+	model := client.GenerativeModel(geminiModelName)
+	// Set System Instruction if loaded successfully
+	if systemInstruction != "" {
+		model.SystemInstruction = &genai.Content{
+			Parts: []genai.Part{genai.Text(systemInstruction)},
+		}
+		log.Println("System instruction loaded successfully.")
+	}
+
+	model.Tools = []*genai.Tool{{
+		FunctionDeclarations: []*genai.FunctionDeclaration{{
+			Name:        "agent_action",
+			Description: "Specify the next action for the agent: a message, a command, or a signal.",
+			Parameters:  agentResponseSchema,
+		}},
+	}}
+	model.ToolConfig = &genai.ToolConfig{
+		FunctionCallingConfig: &genai.FunctionCallingConfig{
+			// Mode: genai.FunctionCallingModeAuto, // Omit Mode, let it default to Auto
+			AllowedFunctionNames: []string{"agent_action"},
+		},
+	}
+
+	// --- Start Chat Session ---
+	cs := model.StartChat()
+	// TODO: Load initial history if available
+
+	// --- Create Agent Instance ---
 	return &Agent{
 		cmdRegistry:   registry,
-		// llmClient:     llmClient,
-		// parser:        parser,
-		userInputChan: make(chan string, 1), // Buffered slightly
+		genaiClient:   client,
+		chatSession:   cs,
+		userInputChan: make(chan string, 1),
 		termOutputBuf: &bytes.Buffer{},
 		stopChan:      make(chan struct{}),
-	}
+	}, nil
 }
 
 // Run starts the main agent loop.
@@ -56,13 +131,17 @@ func (a *Agent) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	a.cancelContext = cancel
 	defer cancel()
+	// Close genai client on exit
+	defer func() {
+		if err := a.genaiClient.Close(); err != nil {
+			log.Printf("Error closing genai client: %v", err)
+		}
+	}()
 
 	// 1. Initialize Terminal Controller
 	a.termController = terminal.NewPtyController()
 
 	// 2. Setup MultiWriter for terminal output
-	// Output goes to user (os.Stdout) and agent buffer (a.termOutputBuf)
-	// We need a thread-safe way to access the buffer.
 	outputWriter := NewSynchronizedBufferWriter(a.termOutputBuf, &a.mu, a.handleTerminalOutput)
 	multiOut := io.MultiWriter(os.Stdout, outputWriter)
 	a.termController.SetOutput(multiOut)
@@ -95,14 +174,12 @@ func (a *Agent) Run(ctx context.Context) error {
 
 		case line := <-a.userInputChan:
 			if a.handleUserInput(ctx, line) {
-				// If user input triggers LLM or internal command, process immediately
-				// (handleUserInput calls processAgentTurn if needed)
+				// User input handled internally or triggered agent turn
 			} else {
-				// Otherwise, send directly to terminal PTY
+				// Send directly to terminal PTY
 				_, err := a.termController.Write([]byte(line + "\n"))
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error writing to terminal: %v\n", err)
-					// Consider how to handle this error (e.g., inform user/agent)
 				}
 			}
 
@@ -111,12 +188,11 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.processAgentTurn(ctx, "terminal_output")
 
 		case <-periodicTicker.C: // Periodic check
-			// Check if there's unread output and enough time has passed
 			a.mu.Lock()
 			hasOutput := a.termOutputBuf.Len() > 0
-			lastOutputTime := a.lastOutput
+			// lastOutputTime := a.lastOutput // Use this if needed
 			a.mu.Unlock()
-			if hasOutput && time.Since(lastOutputTime) >= periodicUpdateInterval {
+			if hasOutput /* && time.Since(lastOutputTime) >= periodicUpdateInterval */ {
 				fmt.Println("[Debug] Periodic timer triggered agent turn")
 				a.processAgentTurn(ctx, "periodic_update")
 			}
@@ -156,7 +232,6 @@ func (a *Agent) readUserInput() {
 }
 
 // handleUserInput checks for internal commands or prepares for LLM.
-// Returns true if the input was handled internally or triggers an agent turn.
 func (a *Agent) handleUserInput(ctx context.Context, line string) bool {
 	if strings.HasPrefix(line, "/") {
 		parts := strings.Fields(line)
@@ -169,8 +244,6 @@ func (a *Agent) handleUserInput(ctx context.Context, line string) bool {
 			return true // Handled (by showing error)
 		}
 
-		// Execute command (needs context with dependencies)
-		// TODO: Inject dependencies (LLM, Memory, etc.) into context
 		fmt.Printf("[Executing Internal Command: /%s]\n", commandName)
 		err := cmd.Execute(ctx, args)
 		if err != nil {
@@ -179,7 +252,10 @@ func (a *Agent) handleUserInput(ctx context.Context, line string) bool {
 		return true // Command execution handled
 	}
 
-	// Regular user input, trigger LLM processing
+	// Store user input and trigger LLM processing
+	a.mu.Lock()
+	a.lastUserInput = line
+	a.mu.Unlock()
 	a.processAgentTurn(ctx, "user_input")
 	return true
 }
@@ -218,61 +294,125 @@ func (a *Agent) getOutputTimerChannel() <-chan time.Time {
 // processAgentTurn collects context, calls LLM, and handles the response.
 func (a *Agent) processAgentTurn(ctx context.Context, trigger string) {
 	a.mu.Lock()
-	// Stop output timer if it's running, as we are processing now
+	// Stop output timer
 	if a.outputTimer != nil {
 		if !a.outputTimer.Stop() {
 			// Drain?
 		}
-		a.outputTimer = nil // Prevent immediate re-trigger
+		a.outputTimer = nil
 	}
 
-	// 1. Get terminal output from buffer
+	// Get context
 	terminalOutput := a.termOutputBuf.String()
-	a.termOutputBuf.Reset() // Clear buffer after reading
+	a.termOutputBuf.Reset()
+	currentUserInput := "" // Get last user input if trigger is user_input
+	if trigger == "user_input" {
+		currentUserInput = a.lastUserInput
+		a.lastUserInput = "" // Clear after consuming
+	}
 	a.mu.Unlock()
 
 	fmt.Printf("[Agent Turn Triggered by: %s]\n", trigger)
+
+	// 2. Construct LLM Message Part(s)
+	var promptParts []genai.Part
+	if trigger == "user_input" {
+		promptParts = append(promptParts, genai.Text(fmt.Sprintf("User Request: %s", currentUserInput)))
+	} else {
+		promptParts = append(promptParts, genai.Text(fmt.Sprintf("Event Trigger: %s", trigger)))
+	}
 	if terminalOutput != "" {
-		fmt.Printf("[Terminal Output Context:]\n%s\n[/Terminal Output Context]\n", terminalOutput)
+		promptParts = append(promptParts, genai.Text(fmt.Sprintf("\n\n[Recent Terminal Output:]\n%s", terminalOutput)))
 	}
 
-	// 2. Construct Prompt (including user input if trigger=="user_input", history, terminalOutput, etc.)
-	// prompt := constructPrompt(userInput, terminalOutput, history...)
-	fmt.Println("[Simulating LLM Call...] ")
+	// 3. Call LLM
+	fmt.Println("[Calling Gemini...] ")
+	resp, err := a.chatSession.SendMessage(ctx, promptParts...)
+	if err != nil {
+		log.Printf("Error calling Gemini: %v", err)
+		// TODO: How to recover or inform user?
+		// Maybe display error message via AgentResponse.Msg?
+		fmt.Fprintf(os.Stderr, "Error communicating with LLM: %v\n", err)
+		return
+	}
 
-	// 3. Call LLM (Placeholder)
-	// llmResponse, err := a.llmClient.Generate(ctx, prompt)
-	// Handle error
-	llmResponse := "{\"cmd\": \"echo Processed trigger: " + trigger + "\"}" // Simulate echo command
-	fmt.Printf("[Simulated LLM Response: %s]\n", llmResponse)
+	// 4. Parse LLM Response (extract function call)
+	var agentResp AgentResponse
+	processed := false
+	if len(resp.Candidates) > 0 && len(resp.Candidates[0].Content.Parts) > 0 {
+		part := resp.Candidates[0].Content.Parts[0]
+		if fc, ok := part.(genai.FunctionCall); ok {
+			if fc.Name == "agent_action" {
+				jsonData, err := json.Marshal(fc.Args)
+				if err != nil {
+					log.Printf("Error marshaling function call args: %v", err)
+				} else {
+					if err := json.Unmarshal(jsonData, &agentResp); err != nil {
+						log.Printf("Error unmarshaling agent response JSON: %v", err)
+						// Attempt to extract text part as fallback message?
+					} else {
+						processed = true
+						fmt.Printf("[LLM Response Parsed: %+v]\n", agentResp)
+					}
+				}
+			}
+		} else if txt, ok := part.(genai.Text); ok {
+			// If no function call, treat the text as a simple message
+			agentResp.Msg = string(txt)
+			processed = true
+			fmt.Printf("[LLM Text Response: %s]\n", agentResp.Msg)
+		}
+	}
 
-	// 4. Parse LLM Response (Placeholder)
-	// action := a.parser.Parse(llmResponse)
-	parsedCmd := "echo Processed trigger: " + trigger // Simulate parsing
-	parsedSignal := ""
+	if !processed {
+		log.Println("Warning: Could not process LLM response.")
+		agentResp.Msg = "[Agent Error: Could not process response]"
+		// Potentially add original response text here if available
+	}
 
 	// 5. Execute Action
-	if parsedCmd != "" {
-		fmt.Printf("[Sending Command to Terminal: %s]\n", parsedCmd)
-		_, err := a.termController.Write([]byte(parsedCmd + "\n"))
+	if agentResp.Msg != "" {
+		fmt.Printf("[Agent]: %s\n", agentResp.Msg)
+	}
+
+	if agentResp.Cmd != "" {
+		fmt.Printf("[Sending Command to Terminal: %s]\n", agentResp.Cmd)
+		_, err := a.termController.Write([]byte(agentResp.Cmd + "\n"))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error writing command to terminal: %v\n", err)
 		}
-	} else if parsedSignal != "" {
-		// Map signal name (e.g., "SIGINT") to os.Signal
-		// sig := mapSignal(parsedSignal)
-		// if sig != nil {
-		// 	 fmt.Printf("[Sending Signal to Terminal: %v]\n", sig)
-		// 	 err := a.termController.SendSignal(sig)
-		// 	 if err != nil {
-		// 		 fmt.Fprintf(os.Stderr, "Error sending signal: %v\n", err)
-		// 	 }
-		// } else {
-		// 	 fmt.Fprintf(os.Stderr, "Unknown signal in LLM response: %s\n", parsedSignal)
-		// }
+	} else if agentResp.Signal != "" {
+		// Map signal name to os.Signal
+		sig := mapSignal(agentResp.Signal) // Need to implement mapSignal
+		if sig != nil {
+			fmt.Printf("[Sending Signal to Terminal: %v (%s)]\n", sig, agentResp.Signal)
+			err := a.termController.SendSignal(sig)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error sending signal: %v\n", err)
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "Unknown signal in LLM response: %s\n", agentResp.Signal)
+		}
 	}
 
-	// 6. Update history, state, etc.
+	// 6. Update history is handled automatically by chatSession.SendMessage
+
+}
+
+// mapSignal converts a signal name string to an os.Signal.
+// TODO: Make this more comprehensive.
+func mapSignal(signalName string) os.Signal {
+	switch strings.ToUpper(signalName) {
+	case "SIGINT":
+		return os.Interrupt // syscall.SIGINT
+	case "SIGTERM":
+		return os.Kill // syscall.SIGTERM
+	case "SIGKILL":
+		return os.Kill // syscall.SIGKILL
+	// Add other common signals as needed (SIGTSTP, SIGHUP, etc.)
+	default:
+		return nil
+	}
 }
 
 // --- Helper for synchronized buffer writing ---

@@ -34,6 +34,7 @@ constructo/
 │   └── utils/              # General utilities
 ├── configs/                # Configuration files (e.g., config.yaml.example)
 ├── examples/               # Usage examples
+├── instructions/           # Agent instruction files (e.g., system_prompt.txt)
 └── scripts/                # Utility scripts (e.g., install.sh.example)
 ```
 
