@@ -1,0 +1,21 @@
+# Git files
+.git/
+
+# Docker files
+Dockerfile
+.dockerignore
+
+# Go build outputs (adjust if binary name changes)
+constructo
+constructo.exe 
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+
+# Config file (should not be committed with secrets)
+config.yaml 

@@ -3,24 +3,23 @@ package terminal
 import (
 	"fmt"
 	"io"
+	"log"
+	"os"
 	"sync"
-
-	// Import the correct pty package
-	pty "github.com/aymanbagabas/go-pty"
 )
 
 // Monitor reads from a Pty output and distributes it.
 type Monitor struct {
-	pty    pty.Pty     // Use the interface from the library directly
+	pty    *os.File    // Expecting the *os.File from creack/pty
 	output io.Writer   // Where to write the output (can be changed)
 	mu     sync.Mutex
 	done   chan struct{} // Channel to signal stopping
 }
 
 // NewMonitor creates a new terminal monitor.
-func NewMonitor(p pty.Pty, output io.Writer) *Monitor {
+func NewMonitor(ptyFile *os.File, output io.Writer) *Monitor {
 	return &Monitor{
-		pty:    p,
+		pty:    ptyFile, // Store the *os.File
 		output: output,
 		done:   make(chan struct{}),
 	}
@@ -44,32 +43,30 @@ func (m *Monitor) Stop() {
 	close(m.done)
 }
 
-// run is the main loop for reading from the Pty and writing to output.
+// run is the main loop for reading from the Pty (*os.File) and writing to output.
 func (m *Monitor) run() {
-	buf := make([]byte, 32*1024) // Example buffer size
+	buf := make([]byte, 32*1024)
 	for {
 		select {
 		case <-m.done:
 			return // Stop requested
 		default:
-			n, err := m.pty.Read(buf) // Read directly from the pty.Pty interface
+			n, err := m.pty.Read(buf)
 			if n > 0 {
-				m.mu.Lock() // Lock before accessing/writing to output
+				log.Printf("[Monitor Raw Read]: %q", string(buf[:n]))
+				m.mu.Lock()
 				output := m.output
 				m.mu.Unlock()
 
-				if output != nil { // Check if output is set
+				if output != nil {
 					if _, writeErr := output.Write(buf[:n]); writeErr != nil {
-						// Handle output write error (logging recommended)
-						// Consider if we should stop monitoring on write error
-						fmt.Printf("Monitor write error: %v\n", writeErr) // Replace with logger
+						fmt.Printf("Monitor write error: %v\n", writeErr)
 					}
 				}
 			}
 			if err != nil {
 				if err != io.EOF {
-					// Handle read error (logging recommended)
-					fmt.Printf("Monitor read error: %v\n", err) // Replace with logger
+					fmt.Printf("Monitor read error: %v\n", err)
 				}
 				return // Exit loop on error or EOF
 			}

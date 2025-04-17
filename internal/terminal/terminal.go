@@ -7,13 +7,11 @@ import (
 	"io"
 	"log"
 	"os"
-
-	// "os/exec" // Keep commented out for now, only os.Signal is used
+	"os/exec"
 	"strings"
 	"sync"
 
-	// Explicitly name the imported package
-	pty "github.com/aymanbagabas/go-pty"
+	"github.com/creack/pty"
 )
 
 // Controller defines the interface for managing and interacting with the underlying pseudo-terminal.
@@ -22,10 +20,11 @@ type Controller interface {
 	Start(ctx context.Context, shellCmd string, args ...string) error
 	// Stop terminates the pseudo-terminal and associated processes.
 	Stop() error
-	// Resize(rows, cols uint16) error // TODO: Re-add Resize functionality if needed and feasible
+	// Resize informs the pseudo-terminal about a change in the terminal window size.
+	Resize(rows, cols uint16) error
 	// Write sends data (user input) to the pseudo-terminal's input.
 	// Close closes the writer, which typically signals the end of input to the PTY.
-	io.WriteCloser // The pty.Pty interface includes io.WriteCloser
+	io.WriteCloser // The *os.File returned by pty.Start implements io.WriteCloser
 	// SendSignal sends an OS signal to the underlying process group in the PTY.
 	SendSignal(sig os.Signal) error
 	// SetOutput sets the destination writer for the terminal's output.
@@ -37,9 +36,9 @@ type Controller interface {
 
 // PtyController implements the Controller interface using a pseudo-terminal.
 type PtyController struct {
-	pty     pty.Pty      // Use the interface type directly
-	cmd     *pty.Cmd      // Store the wrapper command from the library
-	monitor *Monitor      // Reads output from pty
+	ptyFile *os.File      // Master side of the PTY from creack/pty
+	cmd     *exec.Cmd     // The shell command process
+	monitor *Monitor      // Reads output from ptyFile
 	mu      sync.RWMutex  // Protects access to internal state
 	output  io.Writer     // Destination for monitored output (can be nil)
 	stopped bool
@@ -57,8 +56,9 @@ func (c *PtyController) SetOutput(output io.Writer) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.output = output
-	// If monitor exists, update its output writer as well
 	if c.monitor != nil {
+		// Monitor now expects an *os.File, need adjustment if monitor interface changes
+		// Assuming monitor can handle the output setting directly
 		c.monitor.SetOutput(output)
 	}
 }
@@ -74,7 +74,7 @@ func (c *PtyController) Start(ctx context.Context, shellCmd string, args ...stri
 
 	// Re-lock for state check and modification (briefly)
 	c.mu.Lock()
-	if c.cmd != nil || c.pty != nil {
+	if c.cmd != nil || c.ptyFile != nil {
 		c.mu.Unlock()
 		return fmt.Errorf("terminal controller already started")
 	}
@@ -82,25 +82,19 @@ func (c *PtyController) Start(ctx context.Context, shellCmd string, args ...stri
 
 	// Determine shell command if not provided
 	if shellCmd == "" {
-		shellCmd = defaultShell()
+		shellCmd = defaultShell() // defaultShell should prioritize /bin/bash or similar on Linux
 		if shellCmd == "" {
-			return fmt.Errorf("could not determine default shell")
+			return fmt.Errorf("could not determine default shell (ensure /bin/bash or similar exists)")
 		}
 	}
 
-	// Create the pty instance first
-	newPty, err := pty.New()
+	// Create the command
+	cmd := exec.CommandContext(ctx, shellCmd, args...)
+
+	// Start the command within a PTY.
+	ptyF, err := pty.Start(cmd)
 	if err != nil {
-		return fmt.Errorf("failed to create pty: %w", err)
-	}
-
-	// Create the command associated with the pty
-	cmdWrapper := newPty.CommandContext(ctx, shellCmd, args...)
-
-	// Start the command
-	if err = cmdWrapper.Start(); err != nil {
-		_ = newPty.Close() // Clean up PTY if command fails to start
-		return fmt.Errorf("failed to start command in pty: %w", err)
+		return fmt.Errorf("failed to start pty: %w", err)
 	}
 
 	// Re-acquire lock to update controller state safely
@@ -108,21 +102,19 @@ func (c *PtyController) Start(ctx context.Context, shellCmd string, args ...stri
 	defer c.mu.Unlock()
 
 	// Check if another Start raced and succeeded (unlikely but possible)
-	if c.cmd != nil || c.pty != nil {
-		_ = newPty.Close()
-		if cmdWrapper.Process != nil {
-			_ = cmdWrapper.Process.Kill()
-		}
+	if c.cmd != nil || c.ptyFile != nil {
+		_ = ptyF.Close() // Clean up the newly created PTY
+		_ = cmd.Process.Kill() // Attempt to kill the associated process
 		return fmt.Errorf("terminal controller started concurrently")
 	}
 
-	c.cmd = cmdWrapper
-	c.pty = newPty
+	c.cmd = cmd
+	c.ptyFile = ptyF
 	c.stopped = false
 
 	// --- Monitor Setup ---
-	// Pass the pty.Pty interface directly to the monitor
-	c.monitor = NewMonitor(c.pty, currentOutput)
+	// Pass the *os.File to the monitor
+	c.monitor = NewMonitor(c.ptyFile, currentOutput)
 	c.monitor.Start()
 
 	// Goroutine to wait for the command to exit
@@ -133,12 +125,12 @@ func (c *PtyController) Start(ctx context.Context, shellCmd string, args ...stri
 
 // waitCmd waits for the command process to exit and handles cleanup.
 func (c *PtyController) waitCmd() {
-	// Use the Wait method of the *pty.Cmd wrapper
+	// Use the Wait method of the *exec.Cmd wrapper
 	if c.cmd == nil {
-		log.Println("[WARN] waitCmd called with nil cmd wrapper")
+		log.Println("[WARN] waitCmd called with nil cmd")
 		return
 	}
-	waitErr := c.cmd.Wait() // Wait on the *pty.Cmd wrapper
+	waitErr := c.cmd.Wait() // Wait on the *exec.Cmd wrapper
 	if waitErr != nil {
 		// Log the reason why the command exited (can be normal exit, signal, error)
 		log.Printf("[INFO] Terminal command process exited: %v", waitErr)
@@ -153,8 +145,8 @@ func (c *PtyController) waitCmd() {
 		if c.monitor != nil {
 			c.monitor.Stop()
 		}
-		if c.pty != nil {
-			_ = c.pty.Close()
+		if c.ptyFile != nil {
+			_ = c.ptyFile.Close()
 		}
 		// TODO: Maybe signal agent loop that terminal stopped?
 	}
@@ -178,11 +170,11 @@ func (c *PtyController) Stop() error {
 	}
 
 	// Close the PTY. This should signal the process.
-	if c.pty != nil {
-		if err := c.pty.Close(); err != nil {
+	if c.ptyFile != nil {
+		if err := c.ptyFile.Close(); err != nil {
 			firstErr = fmt.Errorf("failed to close pty: %w", err)
 		}
-		c.pty = nil
+		c.ptyFile = nil
 	}
 
 	// Attempt to kill the underlying process via the wrapper's Process field.
@@ -208,44 +200,43 @@ func (c *PtyController) Stop() error {
 }
 
 // Resize informs the pseudo-terminal about a change in the terminal window size.
-// Resize functionality removed temporarily
-// func (c *PtyController) Resize(rows, cols uint16) error {
-// 	c.mu.RLock()
-// 	currentPty := c.pty
-// 	c.mu.RUnlock()
-//
-// 	if currentPty == nil {
-// 		return fmt.Errorf("terminal not started")
-// 	}
-// 	// TODO: Investigate how to get *os.File or use pty.Setsize correctly
-// 	// return currentPty.SetWinSize(int(rows), int(cols)) // This method doesn't exist on the interface
-// 	return fmt.Errorf("Resize not implemented with current PTY library setup")
-// }
+func (c *PtyController) Resize(rows, cols uint16) error {
+	c.mu.RLock()
+	ptyF := c.ptyFile
+	c.mu.RUnlock()
+
+	if ptyF == nil {
+		return fmt.Errorf("terminal not started")
+	}
+	// Use the helper function from the pty library
+	ws := &pty.Winsize{Rows: rows, Cols: cols}
+	return pty.Setsize(ptyF, ws)
+}
 
 // Write sends data (user input) to the pseudo-terminal's input.
 func (c *PtyController) Write(p []byte) (n int, err error) {
 	c.mu.RLock()
-	currentPty := c.pty
+	ptyF := c.ptyFile
 	c.mu.RUnlock()
-	if currentPty == nil {
+	if ptyF == nil {
 		return 0, fmt.Errorf("terminal not started")
 	}
 	// Call Write directly on the interface value
-	return currentPty.Write(p)
+	return ptyF.Write(p)
 }
 
 // Close closes the writer side of the PTY.
 // This typically signals EOF to the process running in the PTY.
 func (c *PtyController) Close() error {
 	c.mu.RLock()
-	currentPty := c.pty
+	ptyF := c.ptyFile
 	c.mu.RUnlock()
 
-	if currentPty == nil {
+	if ptyF == nil {
 		return fmt.Errorf("terminal not started")
 	}
 	// Call Close directly on the interface value
-	return currentPty.Close()
+	return ptyF.Close()
 }
 
 // SendSignal sends an OS signal to the process running in the PTY.
@@ -253,15 +244,15 @@ func (c *PtyController) Close() error {
 // associated with the PTY, which is usually the desired behavior for signals like SIGINT.
 func (c *PtyController) SendSignal(sig os.Signal) error {
 	c.mu.RLock()
-	cmdWrapper := c.cmd
+	cmdProc := c.cmd
 	c.mu.RUnlock()
 
-	if cmdWrapper == nil || cmdWrapper.Process == nil {
-		return fmt.Errorf("terminal process not running or accessible")
+	if cmdProc == nil || cmdProc.Process == nil {
+		return fmt.Errorf("terminal process not running")
 	}
 
 	// Signal the underlying process via the wrapper's Process field
-	if err := cmdWrapper.Process.Signal(sig); err != nil {
+	if err := cmdProc.Process.Signal(sig); err != nil {
 		// Ignore "process already finished" error when sending signal
 		if errors.Is(err, os.ErrProcessDone) || strings.Contains(err.Error(), "process already finished") {
 			return nil

@@ -141,8 +141,8 @@ func (a *Agent) Run(ctx context.Context) error {
 	// 2. Setup Writer for terminal output
 	// Output goes ONLY to the agent buffer (outputWriter) via the monitor.
 	// The agent will decide what to print to the user's os.Stdout.
+	a.termOutputBuf.Reset() // Explicitly reset buffer before use
 	outputWriter := NewSynchronizedBufferWriter(a.termOutputBuf, &a.mu, a.handleTerminalOutput)
-	// multiOut := io.MultiWriter(os.Stdout, outputWriter) // Remove os.Stdout
 	a.termController.SetOutput(outputWriter) // Set output directly to our buffer writer
 
 	// 3. Start the terminal (using default shell for now)
@@ -274,12 +274,10 @@ func (a *Agent) handleTerminalOutput() {
 	if a.outputTimer == nil {
 		a.outputTimer = time.NewTimer(outputDebounceDuration)
 	} else {
-		if !a.outputTimer.Stop() {
-			// Drain channel if Stop returns false (timer already fired)
-			// This might require reading from the channel in getOutputTimerChannel
-			// For simplicity, we assume Stop works or the timer fires eventually.
-		}
-		a.outputTimer.Reset(outputDebounceDuration)
+		// Stop the existing timer. If Stop returns false, the timer has already fired.
+		// We don't need to drain the channel here; the select loop handles consumption.
+		_ = a.outputTimer.Stop() // We ignore the return value for simplicity
+		a.outputTimer.Reset(outputDebounceDuration) // Reset the timer
 	}
 }
 
@@ -301,15 +299,13 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string) {
 	// fmt.Printf("[Debug] processAgentTurn called with trigger: %s\n", trigger)
 
 	a.mu.Lock()
-	// Stop output timer
+	// Stop output timer if it's running, as we are processing now.
+	// Don't nil it out, just stop it.
 	if a.outputTimer != nil {
-		if !a.outputTimer.Stop() {
-			// Drain?
-		}
-		a.outputTimer = nil
+		if !a.outputTimer.Stop() {}
 	}
 
-	// Get context
+	// Get raw terminal output directly
 	terminalOutput := a.termOutputBuf.String()
 	a.termOutputBuf.Reset()
 	currentUserInput := ""
@@ -317,32 +313,59 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string) {
 		currentUserInput = a.lastUserInput
 		a.lastUserInput = ""
 	}
+	// lastCmdSent := a.lastAgentCmd // Removed
 	a.mu.Unlock()
 
 	fmt.Printf("[Agent Turn Triggered by: %s]\n", trigger)
 
-	// Don't skip agent turn if buffer is empty, maybe user input triggered it
-	// if terminalOutput == "" && trigger != "user_input" {
-	// 	fmt.Println("[Debug] Skipping agent turn: No new terminal output and not user input.")
-	// 	return
-	// }
+	// Remove cleaning logic
+	/* // --- Clean Terminal Output --- 
+	terminalOutputClean := terminalOutputRaw
+	if lastCmdSent != "" {
+		lines := strings.SplitN(terminalOutputRaw, "\n", 2)
+		firstLineTrimmed := strings.TrimSpace(lines[0])
+		if strings.Contains(firstLineTrimmed, lastCmdSent) { 
+			if len(lines) > 1 {
+				terminalOutputClean = strings.TrimSpace(lines[1])
+			} else {
+				terminalOutputClean = ""
+			}
+			log.Printf("[Debug] Cleaned command echo '%s' from terminal output.", lastCmdSent)
+		}
+	}
+	// --- End Cleaning --- */
 
-	// 2. Construct LLM Message Part(s)
+	// 2. Construct LLM Message Part(s) - Use raw terminalOutput
 	var promptParts []genai.Part
-	if trigger == "user_input" {
+	if trigger == "user_input" && currentUserInput != "" {
 		promptParts = append(promptParts, genai.Text(fmt.Sprintf("User Request: %s", currentUserInput)))
 	} else {
-		// If not user input, it's context from terminal output or periodic check
-		if terminalOutput != "" {
-			promptParts = append(promptParts, genai.Text(fmt.Sprintf("Event Trigger: %s\n\n[Recent Terminal Output:]\n%s", trigger, terminalOutput)))
+		if terminalOutput == "" { // Use raw output for check
+			promptParts = append(promptParts, genai.Text(fmt.Sprintf("Event Trigger: %s (No new terminal output)", trigger)))
 		} else {
-			fmt.Println("[Debug] Skipping agent turn: No user input and no new terminal output.")
-			return
+		    promptParts = append(promptParts, genai.Text(fmt.Sprintf("Event Trigger: %s", trigger)))
 		}
-	} 
-	// Always add terminal output context if it exists and wasn't the primary part of the trigger message
-	if terminalOutput != "" && trigger == "user_input" { 
-		promptParts = append(promptParts, genai.Text(fmt.Sprintf("\n\n[Current Terminal Output Context:]\n%s", terminalOutput)))
+	}
+	// Always add raw terminal output context if it exists
+	if terminalOutput != "" {
+		promptParts = append(promptParts, genai.Text(fmt.Sprintf("\n\n[Terminal Output Since Last Turn:]\n%s", terminalOutput)))
+	}
+
+	// --- DEBUG LOG for prompt --- (Keep for now)
+	log.Printf("--- Sending Prompt Parts to LLM ---")
+	for i, part := range promptParts {
+		if txt, ok := part.(genai.Text); ok {
+			log.Printf("Part %d: %s", i, string(txt))
+		} else {
+			log.Printf("Part %d: Non-text part (%T)", i, part)
+		}
+	}
+	log.Printf("--- End Prompt Parts ---")
+	// --- END DEBUG LOG ---
+
+	if len(promptParts) == 0 {
+	    log.Println("[Debug] Skipping agent turn: No effective prompt parts to send.")
+	    return
 	}
 
 	// 3. Call LLM

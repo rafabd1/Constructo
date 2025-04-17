@@ -4,14 +4,16 @@ go 1.24
 
 // Add dependencies here as needed
 
-require github.com/creack/pty v1.1.24
+require (
+	github.com/aymanbagabas/go-pty v0.2.2
+	github.com/creack/pty v1.1.24
+	gopkg.in/yaml.v3 v3.0.1
+)
 
 require (
 	cloud.google.com/go/ai v0.8.0 // indirect
-	github.com/aymanbagabas/go-pty v0.2.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/u-root/u-root v0.11.0 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
 require (
