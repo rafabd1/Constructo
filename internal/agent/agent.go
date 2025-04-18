@@ -9,23 +9,22 @@ import (
 	"io"
 	"log"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/google/generative-ai-go/genai"
 	"github.com/pkg/errors"
 	"github.com/rafabd1/Constructo/internal/commands"
 	"github.com/rafabd1/Constructo/internal/config"
+	"github.com/rafabd1/Constructo/internal/task"
 	"github.com/rafabd1/Constructo/internal/terminal"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
 
 const (
-	outputDebounceDuration = 500 * time.Millisecond
-	periodicUpdateInterval = 1 * time.Minute
-	geminiModelName        = "gemini-2.0-flash"
+	geminiModelName = "gemini-2.0-flash"
 )
 
 // AgentResponse defines the expected JSON structure from the LLM.
@@ -33,6 +32,7 @@ type AgentResponse struct {
 	Msg    string `json:"msg,omitempty"`    // Message to display to the user.
 	Cmd    string `json:"cmd,omitempty"`    // Command to execute in the terminal.
 	Signal string `json:"signal,omitempty"` // OS Signal to send (e.g., "SIGINT").
+	TaskID string `json:"task_id,omitempty"` // Optional: Task ID to target for signal/input
 }
 
 // Define the schema for the AgentResponse
@@ -40,11 +40,10 @@ var agentResponseSchema = &genai.Schema{
 	Type: genai.TypeObject,
 	Properties: map[string]*genai.Schema{
 		"msg":    {Type: genai.TypeString, Description: "Message to display to the user."},
-		"cmd":    {Type: genai.TypeString, Description: "Command to execute in the terminal."},
-		"signal": {Type: genai.TypeString, Description: "OS Signal to send (e.g., 'SIGINT', 'SIGTERM')."},
+		"cmd":    {Type: genai.TypeString, Description: "Command to execute in the terminal. Use standard shell syntax."},
+		"signal": {Type: genai.TypeString, Description: "OS Signal to send (e.g., 'SIGINT', 'SIGTERM'). Use with task_id if targeting a specific command."},
+		"task_id": {Type: genai.TypeString, Description: "ID of the background task to send a signal or input to."},
 	},
-	// Optional: Specify required fields if needed
-	// Required: []string{"msg"}, // Example: msg is always required
 }
 
 // Agent manages the main interaction loop, terminal, and LLM communication.
@@ -53,17 +52,21 @@ type Agent struct {
 	cmdRegistry    *commands.Registry
 	genaiClient    *genai.Client
 	chatSession    *genai.ChatSession
+	execManager    task.ExecutionManager
 
 	userInputChan chan string
-	termOutputBuf *bytes.Buffer
 	mu            sync.Mutex
-	lastOutput    time.Time
-	outputTimer   *time.Timer
 	stopChan      chan struct{}
 	cancelContext context.CancelFunc
 
-	// Store the last user input for context
-	lastUserInput string
+	// Rastreia a última tarefa iniciada (simplificação inicial)
+	lastSubmittedTaskID string
+}
+
+// GetExecutionManager retorna a instância do gerenciador de execução.
+// Necessário para injetar dependência em comandos internos.
+func (a *Agent) GetExecutionManager() task.ExecutionManager {
+	return a.execManager
 }
 
 // NewAgent creates a new agent instance based on the provided configuration.
@@ -78,21 +81,21 @@ func NewAgent(ctx context.Context, cfg *config.Config, registry *commands.Regist
 	// --- Initialize Gemini Client using Config ---
 	apiKey := cfg.LLM.APIKey
 	modelName := cfg.LLM.ModelName
+	if modelName == "" {
+		modelName = geminiModelName // Fallback para constante
+	}
+	log.Printf("Using model: %s", modelName)
 
 	var client *genai.Client
-
 	if apiKey != "" {
 		log.Println("Initializing Gemini client with API Key from config.")
 		client, err = genai.NewClient(ctx, option.WithAPIKey(apiKey))
-		if err != nil {
-			return nil, fmt.Errorf("failed to create genai client with API key: %w", err)
-		}
 	} else {
 		log.Println("API Key not found in config. Attempting to use default credentials (ADC).")
 		client, err = genai.NewClient(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create genai client with default credentials: %w", err)
-		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to create genai client: %w", err)
 	}
 
 	// --- Configure Model ---
@@ -103,22 +106,28 @@ func NewAgent(ctx context.Context, cfg *config.Config, registry *commands.Regist
 		}
 		log.Println("System instruction loaded successfully.")
 	}
-	
-	// Configure for Direct JSON Output
 	model.ResponseMIMEType = "application/json"
-	model.ResponseSchema = agentResponseSchema 
+	model.ResponseSchema = agentResponseSchema
 	log.Println("Model configured for direct JSON output.")
 
 	// --- Start Chat Session ---
 	cs := model.StartChat()
+
+	// --- Create Execution Manager ---
+	execMgr := task.NewManager()
+	if err := execMgr.Start(); err != nil {
+		// Tenta fechar o cliente genai se a inicialização do manager falhar
+		_ = client.Close()
+		return nil, fmt.Errorf("failed to start execution manager: %w", err)
+	}
 
 	// --- Create Agent Instance ---
 	return &Agent{
 		cmdRegistry:   registry,
 		genaiClient:   client,
 		chatSession:   cs,
+		execManager:   execMgr,
 		userInputChan: make(chan string, 1),
-		termOutputBuf: &bytes.Buffer{},
 		stopChan:      make(chan struct{}),
 	}, nil
 }
@@ -128,39 +137,37 @@ func (a *Agent) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	a.cancelContext = cancel
 	defer cancel()
-	// Close genai client on exit
+
+	// Defer closing resources
 	defer func() {
 		if err := a.genaiClient.Close(); err != nil {
 			log.Printf("Error closing genai client: %v", err)
 		}
+		if err := a.execManager.Stop(); err != nil {
+			log.Printf("Error stopping execution manager: %v", err)
+		}
+		if a.termController != nil {
+			if err := a.termController.Stop(); err != nil {
+				log.Printf("Error stopping terminal controller: %v", err)
+			}
+		}
 	}()
 
-	// 1. Initialize Terminal Controller
+	// 1. Initialize *Main* Terminal Controller
 	a.termController = terminal.NewPtyController()
-
-	// 2. Setup Writer for terminal output
-	// Output goes ONLY to the agent buffer (outputWriter) via the monitor.
-	// The agent will decide what to print to the user's os.Stdout.
-	a.termOutputBuf.Reset() // Explicitly reset buffer before use
-	outputWriter := NewSynchronizedBufferWriter(a.termOutputBuf, &a.mu, a.handleTerminalOutput)
-	a.termController.SetOutput(outputWriter) // Set output directly to our buffer writer
-
-	// 3. Start the terminal (using default shell for now)
-	if err := a.termController.Start(ctx, ""); err != nil {
-		return fmt.Errorf("failed to start terminal controller: %w", err)
+	// SetOutput para o PTY principal - AGORA VAI PARA STDOUT para o usuário ver o REPL
+	a.termController.SetOutput(os.Stdout)
+	// Start the main terminal with the robust REPL
+	if err := a.termController.Start(ctx, ""); err != nil { // Usa shell padrão com REPL
+		return fmt.Errorf("failed to start main terminal controller: %w", err)
 	}
-	defer a.termController.Stop()
 
-	// 4. Start reading user input in a separate goroutine
+	// 2. Start reading user input
 	go a.readUserInput()
-
-	// 5. Start periodic update ticker
-	periodicTicker := time.NewTicker(periodicUpdateInterval)
-	defer periodicTicker.Stop()
 
 	fmt.Println("Constructo Agent Started. Type your requests or /help.")
 
-	// 6. Main select loop
+	// 3. Main select loop - Agora orientado a eventos
 	for {
 		select {
 		case <-ctx.Done():
@@ -173,30 +180,30 @@ func (a *Agent) Run(ctx context.Context) error {
 
 		case line := <-a.userInputChan:
 			// fmt.Printf("[Debug] Received line from userInputChan: %q\n", line)
-			if a.handleUserInput(ctx, line) {
-				// User input handled internally or triggered agent turn
-			} else {
-				// Re-enable direct write for non-command input
-				_, err := a.termController.Write([]byte(line + "\n"))
+			if !a.handleUserInput(ctx, line) {
+				// Se handleUserInput retornar false (não foi comando interno nem log)
+				// É uma requisição para o LLM
+				a.processAgentTurn(ctx, "user_input", line, nil)
+			}
+
+		case event := <-a.execManager.Events():
+			log.Printf("[TaskManager Event]: ID=%s Type=%s Status=%s Err=%v", event.TaskID, event.EventType, event.Status, event.Error)
+			if event.EventType == "completed" {
+				// Pega o estado final da tarefa para incluir a saída
+				taskStatus, err := a.execManager.GetTaskStatus(event.TaskID)
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error writing to terminal: %v\n", err)
+					log.Printf("Error getting status for completed task %s: %v", event.TaskID, err)
+					// Decide o que fazer - talvez informar o LLM sobre o erro?
+					continue
 				}
-				// fmt.Println("[Debug] Direct write to terminal disabled for hang test.") // Removed
+				// Chama o LLM com o resultado da tarefa
+				a.processAgentTurn(ctx, "task_completed", "", taskStatus)
+			} else if event.EventType == "error" {
+				// Lidar com erros específicos do gerenciador, se houver
+				log.Printf("Execution manager reported error for task %s: %v", event.TaskID, event.Error)
+				// Talvez informar o LLM
 			}
-
-		case <-a.getOutputTimerChannel(): // Debounced output trigger
-			fmt.Println("[Debug] Output timer fired")
-			a.processAgentTurn(ctx, "terminal_output")
-
-		case <-periodicTicker.C: // Periodic check
-			a.mu.Lock()
-			hasOutput := a.termOutputBuf.Len() > 0
-			// lastOutputTime := a.lastOutput // Use this if needed
-			a.mu.Unlock()
-			if hasOutput /* && time.Since(lastOutputTime) >= periodicUpdateInterval */ {
-				fmt.Println("[Debug] Periodic timer triggered agent turn")
-				a.processAgentTurn(ctx, "periodic_update")
-			}
+			// TODO: Lidar com eventos "output" se quisermos streaming
 		}
 	}
 }
@@ -211,7 +218,7 @@ func (a *Agent) Stop() {
 func (a *Agent) readUserInput() {
 	reader := bufio.NewReader(os.Stdin)
 	for {
-		fmt.Print("> ") // Simple prompt
+		fmt.Print("> ") // Prompt simples, agora vindo do Go, não do REPL do bash
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err != io.EOF {
@@ -222,7 +229,6 @@ func (a *Agent) readUserInput() {
 		}
 		line = strings.TrimSpace(line)
 		if line != "" {
-			// fmt.Printf("[Debug] readUserInput sending line: %q\n", line)
 			select {
 			case a.userInputChan <- line:
 			case <-a.stopChan:
@@ -232,10 +238,19 @@ func (a *Agent) readUserInput() {
 	}
 }
 
-// handleUserInput checks for internal commands or prepares for LLM.
-// Returns true if the input was handled internally or triggers an agent turn.
+// handleUserInput checks for internal commands or log feedback.
+// Returns true if the input was handled internally (command or ignored log).
+// Returns false if it's likely a request for the LLM.
 func (a *Agent) handleUserInput(ctx context.Context, line string) bool {
-	// fmt.Printf("[Debug] handleUserInput called with line: %q\n", line)
+	// Filtro de log
+	logPattern := `^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}`
+	matched, _ := regexp.MatchString(logPattern, line)
+	if matched || strings.HasPrefix(line, "[") || strings.HasPrefix(line, "User Request:") || strings.HasPrefix(line, "Event Trigger:") || strings.HasPrefix(line, "Configuration loaded") || strings.HasPrefix(line, "Starting Constructo Agent") || strings.HasPrefix(line, "Constructo Agent Started") || strings.HasPrefix(line, "Error calling Gemini") || strings.HasPrefix(line, "Google API Error Details"){
+		// log.Printf("[Debug] Ignored potential log feedback line: %q", line)
+		return true // Ignorado, considerado "tratado"
+	}
+
+	// Verifica comandos internos
 	if strings.HasPrefix(line, "/") {
 		parts := strings.Fields(line)
 		commandName := strings.TrimPrefix(parts[0], "/")
@@ -244,7 +259,7 @@ func (a *Agent) handleUserInput(ctx context.Context, line string) bool {
 		cmd, exists := a.cmdRegistry.Get(commandName)
 		if !exists {
 			fmt.Printf("Unknown command: %s\n", commandName)
-			return true // Handled (by showing error)
+			return true // Tratado (mostrando erro)
 		}
 
 		fmt.Printf("[Executing Internal Command: /%s]\n", commandName)
@@ -252,129 +267,70 @@ func (a *Agent) handleUserInput(ctx context.Context, line string) bool {
 		if err != nil {
 			fmt.Printf("Error executing command /%s: %v\n", commandName, err)
 		}
-		return true // Command execution handled
+		// TODO: Comandos internos podem precisar interagir com o ExecutionManager também?
+		return true // Comando interno tratado
 	}
 
-	// Regular user input: always trigger agent turn
-	// fmt.Println("[Debug] handleUserInput triggering processAgentTurn for normal input.") // Removed debug log
-	a.mu.Lock()
-	a.lastUserInput = line
-	a.mu.Unlock()
-	a.processAgentTurn(ctx, "user_input")
-	return true // Agent turn was triggered
-}
-
-// handleTerminalOutput is called by SynchronizedBufferWriter when new output arrives.
-func (a *Agent) handleTerminalOutput() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	a.lastOutput = time.Now()
-	// Reset or start the debounce timer
-	if a.outputTimer == nil {
-		a.outputTimer = time.NewTimer(outputDebounceDuration)
-	} else {
-		// Stop the existing timer. If Stop returns false, the timer has already fired.
-		// We don't need to drain the channel here; the select loop handles consumption.
-		_ = a.outputTimer.Stop() // We ignore the return value for simplicity
-		a.outputTimer.Reset(outputDebounceDuration) // Reset the timer
-	}
-}
-
-// getOutputTimerChannel returns the timer channel, handling nil timer.
-func (a *Agent) getOutputTimerChannel() <-chan time.Time {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.outputTimer == nil {
-		// Return a channel that never receives if timer is not set
-		// (avoids nil channel read in select)
-		return nil
-	}
-	return a.outputTimer.C
+	// Se não for log e não for comando interno, é para o LLM
+	return false
 }
 
 // processAgentTurn collects context, calls LLM, and handles the response.
-func (a *Agent) processAgentTurn(ctx context.Context, trigger string) {
-	// Remove temporary simplification log
-	// fmt.Printf("[Debug] processAgentTurn called with trigger: %s\n", trigger)
+// Agora recebe o input do usuário OU o resultado de uma tarefa concluída.
+func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput string, completedTask *task.Task) {
+	
+	// 1. Construir o prompt para o LLM - AGORA COMO HISTÓRICO DE CONTEÚDO
+	var currentTurnParts []genai.Part
 
-	a.mu.Lock()
-	// Stop output timer if it's running, as we are processing now.
-	// Don't nil it out, just stop it.
-	if a.outputTimer != nil {
-		if !a.outputTimer.Stop() {}
-	}
-
-	// Get raw terminal output directly
-	terminalOutput := a.termOutputBuf.String()
-	a.termOutputBuf.Reset()
-	currentUserInput := ""
-	if trigger == "user_input" {
-		currentUserInput = a.lastUserInput
-		a.lastUserInput = ""
-	}
-	// lastCmdSent := a.lastAgentCmd // Removed
-	a.mu.Unlock()
-
-	fmt.Printf("[Agent Turn Triggered by: %s]\n", trigger)
-
-	// Remove cleaning logic
-	/* // --- Clean Terminal Output --- 
-	terminalOutputClean := terminalOutputRaw
-	if lastCmdSent != "" {
-		lines := strings.SplitN(terminalOutputRaw, "\n", 2)
-		firstLineTrimmed := strings.TrimSpace(lines[0])
-		if strings.Contains(firstLineTrimmed, lastCmdSent) { 
-			if len(lines) > 1 {
-				terminalOutputClean = strings.TrimSpace(lines[1])
-			} else {
-				terminalOutputClean = ""
-			}
-			log.Printf("[Debug] Cleaned command echo '%s' from terminal output.", lastCmdSent)
+	if userInput != "" {
+		// Turno iniciado pelo usuário
+		currentTurnParts = append(currentTurnParts, genai.Text(userInput))
+		log.Printf("--- Sending User Input to LLM ---")
+		log.Printf("User: %s", userInput)
+		log.Printf("--- End User Input ---")
+	} else if completedTask != nil {
+		// Turno iniciado pela conclusão de uma tarefa
+		// Construir uma representação estruturada do resultado da tarefa
+		// Idealmente, usaríamos genai.FunctionResponse, mas vamos simular com texto estruturado por enquanto
+		// para manter a compatibilidade com o chatSession simples.
+		// Futuramente: Mudar para Function Calling/Tool Use real.
+		
+		taskResultText := bytes.NewBufferString("")
+		fmt.Fprintf(taskResultText, "[Task Result - ID: %s]\n", completedTask.ID)
+		fmt.Fprintf(taskResultText, "Command: %s\n", completedTask.CommandString)
+		fmt.Fprintf(taskResultText, "Status: %s (Exit Code: %d)\n", completedTask.Status, completedTask.ExitCode)
+		if completedTask.Error != nil {
+			fmt.Fprintf(taskResultText, "Error: Execution failed\n") // Info simples para LLM
 		}
-	}
-	// --- End Cleaning --- */
-
-	// 2. Construct LLM Message Part(s) - Use raw terminalOutput
-	var promptParts []genai.Part
-	if trigger == "user_input" && currentUserInput != "" {
-		promptParts = append(promptParts, genai.Text(fmt.Sprintf("User Request: %s", currentUserInput)))
+		output := completedTask.OutputBuffer.String()
+		if len(output) > 2000 { 
+			output = output[:2000] + "\n... (output truncated)"
+		}
+		fmt.Fprintf(taskResultText, "Output:\n%s\n", output)
+		fmt.Fprintf(taskResultText, "[End Task Result - ID: %s]", completedTask.ID)
+		
+		// Adicionar como uma parte de 'tool' ou 'function' simulada (usando role 'user' por enquanto)
+		currentTurnParts = append(currentTurnParts, genai.Text(taskResultText.String()))
+		log.Printf("--- Sending Task Result to LLM ---")
+		log.Printf("%s", taskResultText.String())
+		log.Printf("--- End Task Result ---")
 	} else {
-		if terminalOutput == "" { // Use raw output for check
-			promptParts = append(promptParts, genai.Text(fmt.Sprintf("Event Trigger: %s (No new terminal output)", trigger)))
-		} else {
-		    promptParts = append(promptParts, genai.Text(fmt.Sprintf("Event Trigger: %s", trigger)))
-		}
-	}
-	// Always add raw terminal output context if it exists
-	if terminalOutput != "" {
-		promptParts = append(promptParts, genai.Text(fmt.Sprintf("\n\n[Terminal Output Since Last Turn:]\n%s", terminalOutput)))
+		log.Println("Warning: processAgentTurn called without user input or completed task.")
+		return // Nada a fazer
 	}
 
-	// --- DEBUG LOG for prompt --- (Keep for now)
-	log.Printf("--- Sending Prompt Parts to LLM ---")
-	for i, part := range promptParts {
-		if txt, ok := part.(genai.Text); ok {
-			log.Printf("Part %d: %s", i, string(txt))
-		} else {
-			log.Printf("Part %d: Non-text part (%T)", i, part)
-		}
-	}
-	log.Printf("--- End Prompt Parts ---")
-	// --- END DEBUG LOG ---
-
-	if len(promptParts) == 0 {
+	if len(currentTurnParts) == 0 {
 	    log.Println("[Debug] Skipping agent turn: No effective prompt parts to send.")
 	    return
 	}
 
-	// 3. Call LLM
+	// 2. Call LLM
 	fmt.Println("[Calling Gemini...] ")
-	resp, err := a.chatSession.SendMessage(ctx, promptParts...)
+	// Envia as partes da *rodada atual*. O chatSession mantém o histórico anterior.
+	resp, err := a.chatSession.SendMessage(ctx, currentTurnParts...)
 	if err != nil {
 		log.Printf("Error calling Gemini: %v", err)
-
-		// Attempt to get more details from googleapi.Error
+		// ... (tratamento de erro da API como antes) ...
 		var googleAPIErr *googleapi.Error
 		if errors.As(err, &googleAPIErr) {
 			log.Printf("Google API Error Details: Code=%d, Message=%s, Body=%s",
@@ -382,133 +338,116 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string) {
 			fmt.Fprintf(os.Stderr, "Error communicating with LLM (Code %d): %s\nDetails: %s\n",
 				googleAPIErr.Code, googleAPIErr.Message, string(googleAPIErr.Body))
 		} else {
-			// Fallback for non-googleapi errors
 			fmt.Fprintf(os.Stderr, "Error communicating with LLM: %v\n", err)
 		}
 		return
 	}
 
-	// 4. Parse LLM Response (expect direct JSON in Text part)
+	// 3. Parse LLM Response
 	var agentResp AgentResponse
 	processed := false
-
-	if resp == nil {
-		log.Println("Warning: Received nil response from LLM.")
-	} else if len(resp.Candidates) == 0 {
-		log.Println("Warning: Received response with no candidates from LLM.")
-		if resp.PromptFeedback != nil {
-			log.Printf("Prompt Feedback: BlockReason=%v, SafetyRatings=%+v", resp.PromptFeedback.BlockReason, resp.PromptFeedback.SafetyRatings)
-		}
-	} else if resp.Candidates[0].Content == nil {
-		log.Println("Warning: Received candidate with nil content from LLM.")
-		candidate := resp.Candidates[0]
-		log.Printf("Candidate FinishReason: %v, SafetyRatings: %+v, CitationMetadata: %+v",
-			candidate.FinishReason, candidate.SafetyRatings, candidate.CitationMetadata)
-	} else if len(resp.Candidates[0].Content.Parts) == 0 {
-		log.Println("Warning: Received candidate content with no parts from LLM.")
-		candidate := resp.Candidates[0]
-		log.Printf("Candidate FinishReason: %v, SafetyRatings: %+v, CitationMetadata: %+v",
-			candidate.FinishReason, candidate.SafetyRatings, candidate.CitationMetadata)
-	} else {
-		// Expect the JSON content directly in the first Text part
+	// ... (lógica de parseamento JSON como antes) ...
+	if resp != nil && len(resp.Candidates) > 0 && resp.Candidates[0].Content != nil && len(resp.Candidates[0].Content.Parts) > 0 {
 		part := resp.Candidates[0].Content.Parts[0]
 		if txt, ok := part.(genai.Text); ok {
 			jsonData := []byte(txt)
-			if err := json.Unmarshal(jsonData, &agentResp); err != nil {
-				log.Printf("Error unmarshaling direct JSON response: %v\nJSON received: %s", err, string(jsonData))
-			} else {
+			if err := json.Unmarshal(jsonData, &agentResp); err == nil {
 				processed = true
-				fmt.Printf("[LLM JSON Response Parsed: %+v]\n", agentResp)
+				fmt.Printf("[LLM Response Parsed: %+v]\n", agentResp)
+			} else {
+				log.Printf("Error unmarshaling direct JSON response: %v\nJSON received: %s", err, string(jsonData))
 			}
 		} else {
 			log.Printf("Warning: Expected genai.Text part for JSON response, but got %T", part)
 		}
+	} else {
+		log.Printf("Warning: Could not process LLM response structure. Resp: %+v", resp)
+		// Logar feedback se houver
+		if resp != nil && resp.PromptFeedback != nil {
+			log.Printf("Prompt Feedback: BlockReason=%v, SafetyRatings=%+v", resp.PromptFeedback.BlockReason, resp.PromptFeedback.SafetyRatings)
+		}
+		if resp != nil && len(resp.Candidates) > 0 {
+			 log.Printf("Candidate[0] FinishReason: %v, SafetyRatings: %+v", resp.Candidates[0].FinishReason, resp.Candidates[0].SafetyRatings)
+		}
 	}
-	// --- END RESPONSE PROCESSING --- 
 
 	if !processed {
 		log.Println("Warning: Could not process LLM response content.")
 		if agentResp.Msg == "" { 
-		    agentResp.Msg = "[Agent Error: Could not process response content]"
+		    agentResp.Msg = "[Agent Error: Could not process response content. Please check agent logs.]"
 		}
 	}
 
-	// 5. Execute Action
+	// 4. Execute Action
 	if agentResp.Msg != "" {
 		fmt.Printf("[Agent]: %s\n", agentResp.Msg)
 	}
 
 	if agentResp.Cmd != "" {
-		fmt.Printf("[Sending Command to Terminal: %s]\n", agentResp.Cmd)
-		_, err := a.termController.Write([]byte(agentResp.Cmd + "\n"))
+		fmt.Printf("[Submitting Task: %s]\n", agentResp.Cmd)
+		// TODO: Implementar heurística decideIfInteractive
+		isInteractive := false // Por enquanto, assumir não interativo
+		taskID, err := a.execManager.SubmitTask(ctx, agentResp.Cmd, isInteractive)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing command to terminal: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error submitting task: %v\n", err)
+			// Informar o usuário sobre a falha na submissão
+			fmt.Printf("[Agent]: Failed to start command: %s\n", agentResp.Cmd)
+		} else {
+			fmt.Printf("[Task %s Submitted]\n", taskID)
+			a.mu.Lock()
+			a.lastSubmittedTaskID = taskID // Guarda o ID da última tarefa
+			a.mu.Unlock()
 		}
 	} else if agentResp.Signal != "" {
 		sig := mapSignal(agentResp.Signal)
-		if sig != nil {
-			fmt.Printf("[Sending Signal to Terminal: %v (%s)]\n", sig, agentResp.Signal)
-			err := a.termController.SendSignal(sig)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error sending signal: %v\n", err)
-			}
-		} else {
+		if sig == nil {
 			fmt.Fprintf(os.Stderr, "Unknown signal in LLM response: %s\n", agentResp.Signal)
+			fmt.Printf("[Agent]: I don't recognize the signal '%s'.\n", agentResp.Signal)
+			return
 		}
-	}
+		
+		targetTaskID := agentResp.TaskID
+		if targetTaskID == "" {
+			a.mu.Lock()
+			targetTaskID = a.lastSubmittedTaskID // Tenta usar a última tarefa se nenhuma for especificada
+			a.mu.Unlock()
+		}
+		if targetTaskID == "" {
+			fmt.Fprintf(os.Stderr, "Signal requested but no target task ID specified or known.\n")
+			fmt.Printf("[Agent]: I need to know which command (task ID) to send the signal '%s' to.\n", agentResp.Signal)
+			return
+		}
 
-	// 6. Update history is handled automatically by chatSession.SendMessage
+		fmt.Printf("[Sending Signal %v to Task %s]\n", sig, targetTaskID)
+		err := a.execManager.SendSignalToTask(targetTaskID, sig)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error sending signal to task %s: %v\n", targetTaskID, err)
+			fmt.Printf("[Agent]: Failed to send signal %s to task %s. It might have already finished.\n", agentResp.Signal, targetTaskID)
+		}
+	} 
+
+	// 5. Update history é tratado automaticamente pelo chatSession.SendMessage
 
 }
 
 // mapSignal converts a signal name string to an os.Signal.
-// TODO: Make this more comprehensive.
 func mapSignal(signalName string) os.Signal {
 	switch strings.ToUpper(signalName) {
 	case "SIGINT":
-		return os.Interrupt // syscall.SIGINT
+		return os.Interrupt
 	case "SIGTERM":
-		return os.Kill // syscall.SIGTERM
+		return os.Kill // Mapeia para SIGKILL em Go no Unix
 	case "SIGKILL":
-		return os.Kill // syscall.SIGKILL
-	// Add other common signals as needed (SIGTSTP, SIGHUP, etc.)
+		return os.Kill
 	default:
 		return nil
 	}
 }
 
-// --- Helper for synchronized buffer writing ---
+// SynchronizedBufferWriter não é mais necessário com o ExecutionManager
 
-// SynchronizedBufferWriter wraps a bytes.Buffer with a mutex and a callback.
-type SynchronizedBufferWriter struct {
-	buf      *bytes.Buffer
-	mu       *sync.Mutex
-	onWrite func() // Callback function triggered after a successful write
-}
-
-// NewSynchronizedBufferWriter creates a new synchronized writer.
-func NewSynchronizedBufferWriter(buf *bytes.Buffer, mu *sync.Mutex, onWrite func()) *SynchronizedBufferWriter {
-	return &SynchronizedBufferWriter{
-		buf:     buf,
-		mu:      mu,
-		onWrite: onWrite,
-	}
-}
-
-// Write implements io.Writer.
-func (s *SynchronizedBufferWriter) Write(p []byte) (n int, err error) {
-	s.mu.Lock()
-	// Write to buffer under lock
-	n, err = s.buf.Write(p)
-	// Capture callback function pointer under lock
-	onWriteCallback := s.onWrite
-	s.mu.Unlock() // <<< RELEASE LOCK HERE
-
-	// Call callback AFTER lock is released
-	if err == nil && n > 0 && onWriteCallback != nil {
-		onWriteCallback()
-	}
-	return
-}
+// TODO: Implementar decideIfInteractive(cmd string) bool
+// Uma heurística simples pode verificar se o comando é `bash`, `python`, `ssh`, etc.
+// ou se contém subcomandos como `read`.
 
 // Package agent contains the core logic of the AI agent.

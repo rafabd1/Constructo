@@ -11,8 +11,12 @@ import (
 	"github.com/rafabd1/Constructo/internal/agent"
 	"github.com/rafabd1/Constructo/internal/commands"
 	"github.com/rafabd1/Constructo/internal/config"
+	"github.com/rafabd1/Constructo/internal/task"
 	// TODO: Import other command packages if they are separate
 )
+
+// Variável global temporária para armazenar o manager (melhorar com injeção de dependência depois)
+// var globalExecManager task.ExecutionManager
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -37,14 +41,32 @@ func main() {
 	// 1. Create Command Registry
 	registry := commands.NewRegistry()
 
-	// 2. Register Commands (Example - register all from internal/commands)
-	// In a real app, you might have a function to discover and register commands.
-	helpCmd := &commands.HelpCmd{Registry: registry} // HelpCmd needs the registry
+	// 2. Create Agent (PRECISA VIR ANTES para obter o ExecutionManager)
+	//    Isso expõe um pequeno problema de ordem de inicialização que pode ser 
+	//    resolvido com injeção de dependência mais robusta no futuro.
+	constructoAgent, err := agent.NewAgent(ctx, cfg, registry)
+	if err != nil {
+		log.Fatalf("Failed to create agent: %v", err)
+	}
+	// Obter o ExecutionManager do Agent (Exige um método getter no Agent)
+	execManager := constructoAgent.GetExecutionManager() // <<< PRECISA ADICIONAR ESTE MÉTODO AO AGENT
+	if execManager == nil {
+		log.Fatalf("Failed to get execution manager from agent")
+	}
+
+	// 3. Register Commands (Agora podemos injetar dependências)
+	helpCmd := &commands.HelpCmd{Registry: registry}
 	if err := registry.Register(helpCmd); err != nil {
 		log.Fatalf("Failed to register help command: %v", err)
 	}
-	// Register other commands (assuming they don't need complex dependencies for now)
+
+	// Função provider para o TaskCmd
+	getManager := func() task.ExecutionManager {
+		return execManager
+	}
+
 	cmdsToRegister := []commands.Command{
+		&commands.TaskCmd{ExecManagerProvider: getManager}, // <<< Comando Task registrado
 		&commands.MemoryCmd{},
 		&commands.ReasonCmd{},
 		&commands.JudgeCmd{},
@@ -56,17 +78,8 @@ func main() {
 	}
 	for _, cmd := range cmdsToRegister {
 		if err := registry.Register(cmd); err != nil {
-			// Use Fatalf for critical startup errors
 			log.Fatalf("Failed to register command %s: %v", cmd.Name(), err)
 		}
-	}
-	// Make HelpCmd aware of all commands *after* they are registered
-	// helpCmd.Initialize() // Or pass registry later if needed
-
-	// 3. Create Agent (passing config and registry)
-	constructoAgent, err := agent.NewAgent(ctx, cfg, registry)
-	if err != nil {
-		log.Fatalf("Failed to create agent: %v", err)
 	}
 
 	// 4. Run the Agent
