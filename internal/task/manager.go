@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -75,6 +76,9 @@ type ExecutionManager interface {
 
 	// Events retorna um canal somente leitura para receber eventos de tarefas.
 	Events() <-chan TaskEvent
+
+	// GetRunningTasksSummary retorna um resumo das tarefas atualmente em execução.
+	GetRunningTasksSummary() string
 
 	// Start inicia o gerenciador (se necessário para background tasks).
 	Start() error 
@@ -332,4 +336,33 @@ func (m *manager) CancelTask(taskID string) error {
 	// O status final e evento serão definidos pela goroutine da tarefa ao detectar ctx.Err()
 
 	return nil
+}
+
+// GetRunningTasksSummary retorna um resumo das tarefas atualmente em execução.
+func (m *manager) GetRunningTasksSummary() string {
+	m.tasksMu.RLock()
+	defer m.tasksMu.RUnlock()
+
+	var runningTasks []string
+	for id, task := range m.tasks {
+		task.mu.RLock() // Leitura segura do status da tarefa individual
+		status := task.Status
+		cmd := task.CommandString
+		task.mu.RUnlock()
+
+		if status == StatusRunning {
+			// Limitar o tamanho do comando no resumo para evitar poluir o prompt
+			maxCmdLen := 40
+			if len(cmd) > maxCmdLen {
+				cmd = cmd[:maxCmdLen] + "..."
+			}
+			runningTasks = append(runningTasks, fmt.Sprintf("[%s: %s]", id, cmd))
+		}
+	}
+
+	if len(runningTasks) == 0 {
+		return ""
+	}
+
+	return fmt.Sprintf("Running Tasks: %s", strings.Join(runningTasks, ", "))
 } 

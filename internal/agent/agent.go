@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/google/generative-ai-go/genai"
 	"github.com/pkg/errors"
@@ -61,6 +62,8 @@ type Agent struct {
 
 	// Rastreia a última tarefa iniciada (simplificação inicial)
 	lastSubmittedTaskID string
+	// Guarda informação sobre a última falha de ação para enviar ao LLM
+	lastActionFailure error 
 }
 
 // GetExecutionManager retorna a instância do gerenciador de execução.
@@ -279,8 +282,47 @@ func (a *Agent) handleUserInput(ctx context.Context, line string) bool {
 // Agora recebe o input do usuário OU o resultado de uma tarefa concluída.
 func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput string, completedTask *task.Task) {
 	
+	// --- Validação UTF-8 da entrada do usuário ---
+	if userInput != "" && !utf8.ValidString(userInput) {
+		log.Printf("Warning: User input contains invalid UTF-8 sequence: %q", userInput)
+		// Tenta limpar a string substituindo caracteres inválidos.
+		// Isso pode não ser perfeito, mas evita o erro da API.
+		var sanitized strings.Builder
+		for _, r := range userInput {
+			if r == utf8.RuneError {
+				sanitized.WriteRune('\uFFFD') // Unicode replacement character
+			} else {
+				sanitized.WriteRune(r)
+			}
+		}
+		userInput = sanitized.String()
+		log.Printf("Sanitized user input: %q", userInput)
+		// Opcional: Informar o usuário sobre a sanitização?
+		// fmt.Println("[Agent]: Your input contained invalid characters and was sanitized.")
+	}
+	// --- Fim da Validação UTF-8 ---
+
 	// 1. Construir o prompt para o LLM - AGORA COMO HISTÓRICO DE CONTEÚDO
 	var currentTurnParts []genai.Part
+	contextInfo := bytes.NewBufferString("") 
+
+	// Incluir falha da ação anterior, se houver
+	a.mu.Lock()
+	lastFailure := a.lastActionFailure
+	a.lastActionFailure = nil // Limpa após incluir no contexto
+	a.mu.Unlock()
+	if lastFailure != nil {
+		fmt.Fprintf(contextInfo, "[Action Failed: %v]\n\n", lastFailure)
+		log.Printf("Including previous action failure in context: %v", lastFailure)
+	}
+
+	// Adiciona resumo das tarefas em execução
+	runningSummary := a.execManager.GetRunningTasksSummary()
+	if runningSummary != "" {
+		fmt.Fprintf(contextInfo, "\n%s\n", runningSummary)
+	}
+
+	fmt.Fprintf(contextInfo, "\nTrigger: %s\n", trigger) // Movido para depois do resumo
 
 	if userInput != "" {
 		// Turno iniciado pelo usuário
@@ -317,6 +359,18 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 	} else {
 		log.Println("Warning: processAgentTurn called without user input or completed task.")
 		return // Nada a fazer
+	}
+
+	// Adiciona o contexto construído como genai.Text
+	builtContext := contextInfo.String()
+	if builtContext != "" {
+		currentTurnParts = append(currentTurnParts, genai.Text(builtContext))
+		log.Printf("--- Sending Prompt Context to LLM ---")
+		log.Printf("%s", builtContext)
+		log.Printf("--- End Prompt Context ---")
+	} else {
+		log.Println("[Debug] Skipping agent turn: No effective prompt parts generated.")
+		return
 	}
 
 	if len(currentTurnParts) == 0 {
@@ -385,17 +439,19 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 
 	if agentResp.Cmd != "" {
 		fmt.Printf("[Submitting Task: %s]\n", agentResp.Cmd)
-		// TODO: Implementar heurística decideIfInteractive
-		isInteractive := false // Por enquanto, assumir não interativo
+		isInteractive := false 
 		taskID, err := a.execManager.SubmitTask(ctx, agentResp.Cmd, isInteractive)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error submitting task: %v\n", err)
-			// Informar o usuário sobre a falha na submissão
+			failureMsg := fmt.Errorf("SubmitTask failed for command '%s': %w", agentResp.Cmd, err)
+			fmt.Fprintf(os.Stderr, "%v\n", failureMsg)
 			fmt.Printf("[Agent]: Failed to start command: %s\n", agentResp.Cmd)
+			a.mu.Lock()
+			a.lastActionFailure = failureMsg // Guarda a falha
+			a.mu.Unlock()
 		} else {
 			fmt.Printf("[Task %s Submitted]\n", taskID)
 			a.mu.Lock()
-			a.lastSubmittedTaskID = taskID // Guarda o ID da última tarefa
+			a.lastSubmittedTaskID = taskID 
 			a.mu.Unlock()
 		}
 	} else if agentResp.Signal != "" {
@@ -421,9 +477,13 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 		fmt.Printf("[Sending Signal %v to Task %s]\n", sig, targetTaskID)
 		err := a.execManager.SendSignalToTask(targetTaskID, sig)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error sending signal to task %s: %v\n", targetTaskID, err)
-			fmt.Printf("[Agent]: Failed to send signal %s to task %s. It might have already finished.\n", agentResp.Signal, targetTaskID)
-		}
+			failureMsg := fmt.Errorf("SendSignal(%v) failed for task '%s': %w", sig, targetTaskID, err)
+			fmt.Fprintf(os.Stderr, "%v\n", failureMsg)
+			fmt.Printf("[Agent]: Failed to send signal %s to task %s. %v\n", agentResp.Signal, targetTaskID, err)
+			a.mu.Lock()
+			a.lastActionFailure = failureMsg // Guarda a falha
+			a.mu.Unlock()
+		} 
 	} 
 
 	// 5. Update history é tratado automaticamente pelo chatSession.SendMessage
