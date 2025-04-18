@@ -8,10 +8,12 @@ import (
 	"os/signal"
 	syscall "syscall"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/rafabd1/Constructo/internal/agent"
 	"github.com/rafabd1/Constructo/internal/commands"
 	"github.com/rafabd1/Constructo/internal/config"
 	"github.com/rafabd1/Constructo/internal/task"
+	"github.com/rafabd1/Constructo/internal/tui"
 	// TODO: Import other command packages if they are separate
 )
 
@@ -19,54 +21,56 @@ import (
 // var globalExecManager task.ExecutionManager
 
 func main() {
+	f, err := tea.LogToFile("constructo-debug.log", "debug")
+	if err != nil {
+		fmt.Println("fatal: could not open log file:", err)
+		os.Exit(1)
+	}
+	defer f.Close()
+
+	log.Println("--- Starting Constructo Agent --- TUI Mode ---")
+	log.Println("Log file configured.")
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	// 0. Load Configuration
-	cfg, err := config.Load() 
+	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
-	// Validate mandatory config (e.g., API Key if not using ADC)
-	if cfg.LLM.APIKey == "" {
-		// Depending on auth strategy, this might be a fatal error
-		// Or just a warning if ADC is expected to work.
-		log.Println("Warning: llm.api_key is not set in config. Attempting ADC.")
-		// Optionally, check if project_id/location are set for ADC
-		// if cfg.LLM.ProjectID == "" || cfg.LLM.Location == "" {
-		// 	log.Fatalf("Fatal: llm.api_key is missing and llm.project_id/llm.location are not set for ADC.")
-		// }
+	if cfg.LLM.ModelName == "" { // Certificar que o nome do modelo está presente
+		log.Fatalf("Fatal: llm.model_name is missing in the configuration.")
 	}
+	log.Printf("Configuration loaded. Using model: %s", cfg.LLM.ModelName)
+
+	// --- REMOVIDO: Canal tuiChan não é mais necessário aqui ---
+	// tuiChan := make(chan tea.Msg, 10)
+	// -------------------------------------------
 
 	// 1. Create Command Registry
 	registry := commands.NewRegistry()
 
-	// 2. Create Agent (PRECISA VIR ANTES para obter o ExecutionManager)
-	//    Isso expõe um pequeno problema de ordem de inicialização que pode ser 
-	//    resolvido com injeção de dependência mais robusta no futuro.
+	// 2. Create Agent (Não precisa mais do tuiChan)
 	constructoAgent, err := agent.NewAgent(ctx, cfg, registry)
 	if err != nil {
 		log.Fatalf("Failed to create agent: %v", err)
 	}
-	// Obter o ExecutionManager do Agent (Exige um método getter no Agent)
-	execManager := constructoAgent.GetExecutionManager() // <<< PRECISA ADICIONAR ESTE MÉTODO AO AGENT
+	execManager := constructoAgent.GetExecutionManager()
 	if execManager == nil {
 		log.Fatalf("Failed to get execution manager from agent")
 	}
 
-	// 3. Register Commands (Agora podemos injetar dependências)
+	// 3. Register Commands (Needs registry and manager provider)
 	helpCmd := &commands.HelpCmd{Registry: registry}
 	if err := registry.Register(helpCmd); err != nil {
 		log.Fatalf("Failed to register help command: %v", err)
 	}
-
-	// Função provider para o TaskCmd
 	getManager := func() task.ExecutionManager {
 		return execManager
 	}
-
 	cmdsToRegister := []commands.Command{
-		&commands.TaskCmd{ExecManagerProvider: getManager}, // <<< Comando Task registrado
+		&commands.TaskCmd{ExecManagerProvider: getManager},
 		&commands.MemoryCmd{},
 		&commands.ReasonCmd{},
 		&commands.JudgeCmd{},
@@ -82,15 +86,19 @@ func main() {
 		}
 	}
 
-	// 4. Run the Agent
-	fmt.Println("Starting Constructo Agent...")
-	if err := constructoAgent.Run(ctx); err != nil {
-		// Log errors that occur during run, but don't necessarily Fatal
-		log.Printf("Agent run finished with error: %v", err)
-		// Exit with non-zero status on error
+	log.Println("Agent and commands initialized successfully.")
+	log.Println("Attempting to start TUI...")
+
+	// 4. Run the TUI
+	log.Println("Starting TUI...")
+	// StartTUI só precisa do agent e manager
+	if err := tui.StartTUI(constructoAgent, execManager); err != nil {
+		log.Printf("TUI exited with error: %v", err)
 		os.Exit(1)
 	}
 
+	// O programa TUI agora controla o loop principal.
+	// A lógica de shutdown precisa ser gerenciada dentro da TUI ou pelo Agent.
 	fmt.Println("Constructo Agent stopped gracefully.")
 	os.Exit(0)
 }

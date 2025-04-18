@@ -1,12 +1,10 @@
 package agent
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"regexp"
@@ -14,12 +12,14 @@ import (
 	"sync"
 	"unicode/utf8"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/google/generative-ai-go/genai"
 	"github.com/pkg/errors"
 	"github.com/rafabd1/Constructo/internal/commands"
 	"github.com/rafabd1/Constructo/internal/config"
 	"github.com/rafabd1/Constructo/internal/task"
 	"github.com/rafabd1/Constructo/internal/terminal"
+	"github.com/rafabd1/Constructo/pkg/events"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
@@ -54,13 +54,17 @@ type Agent struct {
 	chatSession    *genai.ChatSession
 	execManager    task.ExecutionManager
 
-	userInputChan chan string
+	// Referência ao programa Bubble Tea para enviar mensagens de volta
+	program *tea.Program
+	
+	// Contexto principal do agente para operações em background
+	ctx context.Context
 	mu            sync.Mutex
 	stopChan      chan struct{}
 	cancelContext context.CancelFunc
 
 	lastSubmittedTaskID string
-	lastActionFailure   error 
+	lastActionFailure   error
 }
 
 // GetExecutionManager retorna a instância do gerenciador de execução.
@@ -128,126 +132,21 @@ func NewAgent(ctx context.Context, cfg *config.Config, registry *commands.Regist
 		genaiClient:   client,
 		chatSession:   cs,
 		execManager:   execMgr,
-		userInputChan: make(chan string, 1),
 		stopChan:      make(chan struct{}),
+		ctx:           ctx,
+		program:       nil,
 	}, nil
-}
-
-// Run starts the main agent loop.
-func (a *Agent) Run(ctx context.Context) error {
-	ctx, cancel := context.WithCancel(ctx)
-	a.cancelContext = cancel
-	defer cancel()
-
-	// Defer closing resources
-	defer func() {
-		if err := a.genaiClient.Close(); err != nil {
-			log.Printf("Error closing genai client: %v", err)
-		}
-		if err := a.execManager.Stop(); err != nil {
-			log.Printf("Error stopping execution manager: %v", err)
-		}
-		if a.termController != nil {
-			if err := a.termController.Stop(); err != nil {
-				log.Printf("Error stopping terminal controller: %v", err)
-			}
-		}
-	}()
-
-	// 1. Initialize *Main* Terminal Controller
-	a.termController = terminal.NewPtyController()
-	// SetOutput para o PTY principal - AGORA VAI PARA STDOUT para o usuário ver o REPL
-	a.termController.SetOutput(os.Stdout)
-	// Start the main terminal with the robust REPL
-	if err := a.termController.Start(ctx, ""); err != nil { // Usa shell padrão com REPL
-		return fmt.Errorf("failed to start main terminal controller: %w", err)
-	}
-
-	// 2. Start reading user input
-	go a.readUserInput()
-
-	fmt.Println("Constructo Agent Started. Type your requests or /help.")
-
-	// 3. Main select loop
-	for {
-		select {
-		case <-ctx.Done():
-			fmt.Println("Agent context cancelled. Shutting down...")
-			return ctx.Err()
-
-		case <-a.stopChan:
-			fmt.Println("Agent shutdown requested.")
-			return nil
-
-		case line := <-a.userInputChan:
-			isInternal, isLog := a.parseUserInput(line)
-			if isLog {
-				continue
-			}
-			if !isInternal {
-				a.processAgentTurn(ctx, "user_input", line, nil, nil)
-			} else {
-				// Não logar execução interna aqui, o comando interno pode logar se necessário
-				// fmt.Printf("[Executing Internal Command (User): %s]\n", line)
-				output, err := a.executeInternalCommand(ctx, line)
-				if err != nil {
-					if errors.Is(err, commands.ErrExitRequested) {
-						fmt.Println(output) 
-						a.Stop()
-						return nil
-					}
-					// Imprimir erro e saída para o usuário
-					fmt.Fprintf(os.Stderr, "Error executing internal command: %v\n", err)
-					fmt.Print(output)
-				} else {
-					fmt.Print(output) // Mostra a saída diretamente
-				}
-			}
-
-		case event := <-a.execManager.Events():
-			// Manter este log, é útil para saber o que o manager está fazendo
-			log.Printf("[TaskManager Event]: ID=%s Type=%s Status=%s Err=%v", event.TaskID, event.EventType, event.Status, event.Error)
-			if event.EventType == "completed" {
-				taskStatus, err := a.execManager.GetTaskStatus(event.TaskID)
-				if err != nil {
-					log.Printf("Error getting status for completed task %s: %v", event.TaskID, err) // Manter log de erro
-					continue
-				}
-				a.processAgentTurn(ctx, "task_completed", "", taskStatus, nil)
-			} else if event.EventType == "error" {
-				log.Printf("Execution manager reported error for task %s: %v", event.TaskID, event.Error) // Manter log de erro
-			}
-		}
-	}
 }
 
 // Stop signals the agent to shut down gracefully.
 func (a *Agent) Stop() {
+	log.Println("Agent Stop requested.")
+	// Fechar o stopChan pode sinalizar outras goroutines internas, se houver.
+	// A lógica de parada real (fechar cliente, manager) pode precisar ser coordenada.
 	close(a.stopChan)
-	// Optionally call a.cancelContext() if immediate stop is needed
-}
-
-// readUserInput continuously reads lines from stdin.
-func (a *Agent) readUserInput() {
-	reader := bufio.NewReader(os.Stdin)
-	for {
-		fmt.Print("> ") // Prompt simples, agora vindo do Go, não do REPL do bash
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err != io.EOF {
-				fmt.Fprintf(os.Stderr, "Error reading user input: %v\n", err)
-			}
-			a.Stop()
-			return
-		}
-		line = strings.TrimSpace(line)
-		if line != "" {
-			select {
-			case a.userInputChan <- line:
-			case <-a.stopChan:
-				return
-			}
-		}
+	// Chamar cancelContext pode ser necessário para interromper operações em andamento
+	if a.cancelContext != nil {
+		a.cancelContext()
 	}
 }
 
@@ -269,18 +168,23 @@ func (a *Agent) parseUserInput(line string) (bool, bool) {
 // executeInternalCommand executa um comando interno e retorna sua saída e erro.
 func (a *Agent) executeInternalCommand(ctx context.Context, commandLine string) (output string, err error) {
 	parts := strings.Fields(commandLine)
+	if len(parts) == 0 {
+		return "", fmt.Errorf("internal command cannot be empty")
+	}
 	commandName := strings.TrimPrefix(parts[0], "/")
 	args := parts[1:]
 
 	cmd, exists := a.cmdRegistry.Get(commandName)
 	if !exists {
-		return fmt.Sprintf("Unknown command: %s", commandName), nil // Retorna erro como output
+		// Retorna a mensagem de erro como output
+		return fmt.Sprintf("Unknown command: /%s. Type /help for available commands.", commandName), nil 
 	}
 
 	outputBuf := new(bytes.Buffer)
-	execErr := cmd.Execute(ctx, args, outputBuf)
+	execErr := cmd.Execute(ctx, args, outputBuf) // Comandos internos agora escrevem no buffer
 	
-	return outputBuf.String(), execErr
+	// Retorna a saída capturada e o erro da execução
+	return outputBuf.String(), execErr 
 }
 
 // --- Função Auxiliar para Parsing Robusto ---
@@ -409,30 +313,29 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 	if builtContext != "" {
 		currentTurnParts = append(currentTurnParts, genai.Text(builtContext))
 	} else {
-		log.Println("[Debug] Skipping agent turn: No effective prompt parts generated.")
-		return
+		// Remover log de debug de skip
+		// log.Println("[Debug] Skipping agent turn: No effective prompt parts generated.")
+		return // Skip turn if no context generated
 	}
 
 	if len(currentTurnParts) == 0 {
-	    log.Println("[Debug] Skipping agent turn: No effective prompt parts to send.")
+	    // Remover log de debug de skip
+		// log.Println("[Debug] Skipping agent turn: No effective prompt parts to send.")
 	    return
 	}
 
 	// 2. Call LLM
-	fmt.Println("[Calling Gemini...]")
+	a.sendToTUI(events.AgentOutputMsg{Content: "[Calling Gemini...]"}) // Enviar status para TUI
 	resp, err := a.chatSession.SendMessage(ctx, currentTurnParts...)
 	if err != nil {
-		log.Printf("Error calling Gemini: %v", err)
-		// ... (tratamento de erro da API como antes) ...
+		errMsg := fmt.Sprintf("Error calling LLM: %v", err)
+		log.Printf("%s", errMsg)
+		// Tentar extrair detalhes do erro da API
 		var googleAPIErr *googleapi.Error
 		if errors.As(err, &googleAPIErr) {
-			log.Printf("Google API Error Details: Code=%d, Message=%s, Body=%s",
-				googleAPIErr.Code, googleAPIErr.Message, string(googleAPIErr.Body))
-			fmt.Fprintf(os.Stderr, "Error communicating with LLM (Code %d): %s\nDetails: %s\n",
-				googleAPIErr.Code, googleAPIErr.Message, string(googleAPIErr.Body))
-		} else {
-			fmt.Fprintf(os.Stderr, "Error communicating with LLM: %v\n", err)
+			errMsg = fmt.Sprintf("%s\nDetails: Code=%d, Message=%s, Body=%s", errMsg, googleAPIErr.Code, googleAPIErr.Message, string(googleAPIErr.Body))
 		}
+		a.sendToTUI(events.AgentOutputMsg{Content: fmt.Sprintf("[Agent Error]: %s", errMsg)}) // Enviar erro para TUI
 		return
 	}
 
@@ -478,7 +381,7 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 		log.Println("Warning: Failed to process LLM response into valid JSON structure.")
 		// Gera uma mensagem de erro padrão se o parse falhar e não houver mensagem
 		if parsedResp.Message == "" {
-			parsedResp.Message = fmt.Sprintf("[Agent Error: Could not understand the response format. Please check agent logs. Raw response: %s]", rawResponseText) 
+			parsedResp.Message = fmt.Sprintf("[Agent Error: Could not understand the response format. Raw: %s]", rawResponseText) 
 			if len(parsedResp.Message) > 500 { // Truncar raw response no erro
 				parsedResp.Message = parsedResp.Message[:500] + "...]"
 			}
@@ -488,52 +391,53 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 
 	// 4. Execute Action
 	if parsedResp.Message != "" {
-		fmt.Printf("[Agent]: %s\n", parsedResp.Message)
+		a.sendToTUI(events.AgentOutputMsg{Content: parsedResp.Message})
 	}
 
 	switch parsedResp.Type {
 	case "command", "internal_command":
 		if parsedResp.CommandDetails == nil || parsedResp.CommandDetails.Command == "" {
 			log.Println("Error: LLM response type is command/internal_command but command_details.command is missing or empty.")
-			fmt.Println("[Agent]: I intended to run a command, but I didn't specify which one correctly.")
+			a.sendToTUI(events.AgentOutputMsg{Content: "[Agent Error]: Tried to run command but didn't specify which."}) 
 			break
 		}
 		cmdToRun := parsedResp.CommandDetails.Command
 		if parsedResp.Type == "internal_command" {
 			// --- LLM solicitou comando interno --- 
-			fmt.Printf("[Executing Internal Command (LLM): %s]\n", cmdToRun)
+			a.sendToTUI(events.AgentOutputMsg{Content: fmt.Sprintf("[Executing Internal Command: %s]", cmdToRun)})
 			output, err := a.executeInternalCommand(ctx, cmdToRun)
 			
 			if err != nil {
 				if errors.Is(err, commands.ErrExitRequested) {
-					fmt.Println(output) 
+					// Envia output ("Exiting...") e pede para parar
+					a.sendToTUI(events.AgentOutputMsg{Content: output})
 					a.Stop()
 					return 
 				}
 				log.Printf("Error executing internal command requested by LLM: %v", err)
-				// O erro está incluído na 'output', que será enviada na chamada recursiva
+				// O erro é incluído na output que vai para a chamada recursiva
 			}
 			
-			// <<< CHAMADA RECURSIVA >>>
-			// Chama processAgentTurn imediatamente com o resultado do comando interno
+			// Chama processAgentTurn imediatamente com o resultado
 			log.Printf("Internal command executed, immediately calling agent turn with its result.")
 			a.processAgentTurn(ctx, "internal_command_result", "", nil, &output)
-			return // Retorna para não continuar o fluxo normal deste turno
+			return
 
 		} else {
 			// --- LLM solicitou comando externo --- 
-			fmt.Printf("[Submitting Task: %s]\n", cmdToRun)
-			isInteractive := false // TODO: decideIfInteractive
+			a.sendToTUI(events.AgentOutputMsg{Content: fmt.Sprintf("[Submitting Task: %s]", cmdToRun)})
+			isInteractive := false // TODO
 			taskID, err := a.execManager.SubmitTask(ctx, cmdToRun, isInteractive)
 			if err != nil {
 				failureMsg := fmt.Errorf("SubmitTask failed for command '%s': %w", cmdToRun, err)
-				fmt.Fprintf(os.Stderr, "%v\n", failureMsg)
-				fmt.Printf("[Agent]: Failed to start command: %s\n", cmdToRun)
+				log.Printf("%v", failureMsg) // Log interno
+				a.sendToTUI(events.AgentOutputMsg{Content: fmt.Sprintf("[Agent Error]: Failed to start command: %s]", cmdToRun)}) // Para TUI
 				a.mu.Lock()
-				a.lastActionFailure = failureMsg // Guarda a falha
+				a.lastActionFailure = failureMsg
 				a.mu.Unlock()
 			} else {
-				fmt.Printf("[Task %s Submitted]\n", taskID)
+				// Não precisamos enviar [Task Submitted] para a TUI,
+				// o evento "started" do TaskManager fará isso.
 				a.mu.Lock()
 				a.lastSubmittedTaskID = taskID 
 				a.mu.Unlock()
@@ -541,39 +445,34 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 		}
 	case "signal":
 		if parsedResp.SignalDetails == nil || parsedResp.SignalDetails.Signal == "" || parsedResp.SignalDetails.TaskID == "" {
-			log.Println("Error: LLM response type is signal but signal_details or its fields are missing or empty.")
-			fmt.Println("[Agent]: I intended to send a signal, but I didn't specify the signal or target task correctly.")
+			a.sendToTUI(events.AgentOutputMsg{Content: "[Agent Error]: Tried to send signal but didn't specify signal or target."}) 
 			break
 		}
 		signalName := parsedResp.SignalDetails.Signal
 		targetTaskID := parsedResp.SignalDetails.TaskID
 		sig := mapSignal(signalName)
 		if sig == nil {
-			fmt.Fprintf(os.Stderr, "Unknown signal in LLM response: %s\n", signalName)
-			fmt.Printf("[Agent]: I don't recognize the signal '%s'.\n", signalName)
+			a.sendToTUI(events.AgentOutputMsg{Content: fmt.Sprintf("[Agent Error]: Unknown signal '%s'.", signalName)})
 			break
 		}
-		
-		fmt.Printf("[Sending Signal %v to Task %s]\n", sig, targetTaskID)
+		a.sendToTUI(events.AgentOutputMsg{Content: fmt.Sprintf("[Sending Signal %v to Task %s]", sig, targetTaskID)})
 		err := a.execManager.SendSignalToTask(targetTaskID, sig)
 		if err != nil {
 			failureMsg := fmt.Errorf("SendSignal(%v) failed for task '%s': %w", sig, targetTaskID, err)
-			fmt.Fprintf(os.Stderr, "%v\n", failureMsg)
-			fmt.Printf("[Agent]: Failed to send signal %s to task %s. %v\n", signalName, targetTaskID, err)
+			log.Printf("%v", failureMsg)
+			a.sendToTUI(events.AgentOutputMsg{Content: fmt.Sprintf("[Agent Error]: Failed to send signal %s to task %s. %v]", signalName, targetTaskID, err)})
 			a.mu.Lock()
-			a.lastActionFailure = failureMsg // Guarda a falha
+			a.lastActionFailure = failureMsg 
 			a.mu.Unlock()
-		} 
+		}
 	case "response":
-		// Nenhuma ação adicional necessária, apenas a mensagem já foi impressa.
+		// Mensagem já enviada no início do passo 4.
 		break
 	default:
-		log.Printf("Warning: Unknown LLM response type: %s", parsedResp.Type)
-		fmt.Printf("[Agent]: I generated an unexpected response type: %s\n", parsedResp.Type)
+		unknownTypeMsg := fmt.Sprintf("[Agent Error]: Received unknown response type from LLM: %s", parsedResp.Type)
+		log.Printf("%s", unknownTypeMsg)
+		//a.sendToTUI(AgentOutputMsg{Content: unknownTypeMsg})
 	}
-
-	// 5. Update history é tratado automaticamente pelo chatSession.SendMessage
-
 }
 
 // mapSignal converts a signal name string to an os.Signal.
@@ -597,3 +496,69 @@ func mapSignal(signalName string) os.Signal {
 // ou se contém subcomandos como `read`.
 
 // Package agent contains the core logic of the AI agent.
+
+// ProcessUserInput recebe input da TUI e inicia o processamento em uma goroutine.
+func (a *Agent) ProcessUserInput(input string) {
+	log.Printf("Agent received user input: %s", input)
+	
+	// Verifica se é um comando interno do usuário
+	isInternal, isLog := a.parseUserInput(input)
+	if isLog {
+		return // Ignorar logs
+	}
+
+	if isInternal {
+		// Executar comando interno diretamente e enviar saída para TUI
+		go func() {
+			a.sendToTUI(events.AgentOutputMsg{Content: fmt.Sprintf("[Executing Internal Command: %s]", input)}) // Informa TUI
+			output, err := a.executeInternalCommand(a.ctx, input)
+			if err != nil {
+				if errors.Is(err, commands.ErrExitRequested) {
+					a.sendToTUI(events.AgentOutputMsg{Content: output})
+					a.Stop()
+					return 
+				}
+				// Envia erro e output para TUI
+				errorMsg := fmt.Sprintf("Error executing command: %v", err)
+				a.sendToTUI(events.AgentOutputMsg{Content: fmt.Sprintf("[Agent Error]: %s\nOutput:\n%s", errorMsg, output)})
+			} else {
+				// Envia output para TUI
+				a.sendToTUI(events.AgentOutputMsg{Content: output})
+			}
+		}()
+	} else {
+		// É input para o LLM, processar como antes
+		go func() {
+			a.processAgentTurn(a.ctx, "user_input", input, nil, nil)
+		}()
+	}
+}
+
+// SetProgram permite que a TUI injete a referência ao programa Bubble Tea.
+func (a *Agent) SetProgram(p *tea.Program) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.program != nil {
+		log.Println("Warning: Trying to set tea.Program on Agent multiple times.")
+		return
+	}
+	a.program = p
+	log.Println("[Agent]: tea.Program reference set.")
+}
+
+// sendToTUI agora usa program.Send.
+func (a *Agent) sendToTUI(msg tea.Msg) {
+	a.mu.Lock() // Usar Lock normal
+	p := a.program 
+	a.mu.Unlock() // Usar Unlock normal
+
+	if p == nil {
+		log.Println("Warning: Agent's tea.Program reference is nil. Cannot send message:", msg)
+		return
+	}
+	log.Printf("[Agent->TUI Send Attempt (via Program.Send)]: %+v", msg)
+	go func() { 
+	   p.Send(msg)
+	   log.Printf("[Agent->TUI Send Success (via Program.Send)]")
+	}()
+}
