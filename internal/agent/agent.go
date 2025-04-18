@@ -28,29 +28,22 @@ const (
 	// Removido: geminiModelName        = "gemini-1.5-flash"
 )
 
-// AgentResponse defines the expected JSON structure from the LLM.
-type AgentResponse struct {
-	Msg    string `json:"msg,omitempty"`    // Message to display to the user.
-	Cmd    string `json:"cmd,omitempty"`    // Command to execute in the terminal.
-	Signal string `json:"signal,omitempty"` // OS Signal to send (e.g., "SIGINT").
-	TaskID string `json:"task_id,omitempty"` // Optional: Task ID to target for signal/input
+// --- NOVA Estrutura para Resposta JSON Esperada (Plain Text) ---
+type ParsedLLMResponse struct {
+	Type           string                 `json:"type"`           // "response", "command", "internal_command", "signal"
+	Message        string                 `json:"message"`        // Mandatory
+	CommandDetails *CommandDetails        `json:"command_details,omitempty"`
+	SignalDetails  *SignalDetails         `json:"signal_details,omitempty"`
+	// Adicionar outros campos do exemplo do usuário se necessário (risk, confirmation, etc.)
 }
 
-// Define the schema for the AgentResponse
-var agentResponseSchema = &genai.Schema{
-	Type: genai.TypeObject,
-	Properties: map[string]*genai.Schema{
-		"msg":    {Type: genai.TypeString, Description: "Message to display to the user."},
-		"cmd":    {Type: genai.TypeString, Description: "Command to execute in the terminal. Use standard shell syntax."},
-		"signal": {Type: genai.TypeString, Description: "OS Signal to send (e.g., 'SIGINT', 'SIGTERM'). Use with task_id if targeting a specific command."},
-		"task_id": {Type: genai.TypeString, Description: "ID of the background task to send a signal or input to."},
-	},
+type CommandDetails struct {
+	Command string `json:"command"` // Mandatory if type is command/internal_command
 }
 
-// InternalCommandResult armazena o resultado da execução de um comando interno.
-type InternalCommandResult struct {
-	Output string
-	Error  error
+type SignalDetails struct {
+	Signal string `json:"signal"`  // Mandatory if type is signal
+	TaskID string `json:"task_id"` // Mandatory if type is signal
 }
 
 // Agent manages the main interaction loop, terminal, and LLM communication.
@@ -67,9 +60,7 @@ type Agent struct {
 	cancelContext context.CancelFunc
 
 	lastSubmittedTaskID string
-	lastActionFailure error 
-	// Guarda o resultado do último comando interno executado para incluir no próximo prompt
-	lastInternalResult *InternalCommandResult 
+	lastActionFailure   error 
 }
 
 // GetExecutionManager retorna a instância do gerenciador de execução.
@@ -119,9 +110,6 @@ func NewAgent(ctx context.Context, cfg *config.Config, registry *commands.Regist
 		}
 		log.Println("System instruction loaded successfully.")
 	}
-	model.ResponseMIMEType = "application/json"
-	model.ResponseSchema = agentResponseSchema
-	log.Println("Model configured for direct JSON output.")
 
 	// --- Start Chat Session ---
 	cs := model.StartChat()
@@ -192,24 +180,29 @@ func (a *Agent) Run(ctx context.Context) error {
 			return nil
 
 		case line := <-a.userInputChan:
-			isInternal, _ := a.parseUserInput(line) // Modificado para retornar se é interno
+			isInternal, isLog := a.parseUserInput(line) // Modificado para retornar se é log
+			if isLog {
+				// Ignorar logs
+				continue
+			}
 			if !isInternal {
 				// É input para o LLM
-				a.processAgentTurn(ctx, "user_input", line, nil, nil)
+				a.processAgentTurn(ctx, "user_input", line, nil, nil) // Último nil: internalResult
 			} else {
-				// Usuário digitou um comando interno diretamente - executar e mostrar output,
-				// mas *não* enviar resultado para o LLM (para evitar loop se usuário digitar /task status)
+				// Usuário digitou um comando interno diretamente
 				fmt.Printf("[Executing Internal Command (User): %s]\n", line)
 				output, err := a.executeInternalCommand(ctx, line) 
 				if err != nil {
 					if errors.Is(err, commands.ErrExitRequested) {
-						fmt.Println(output) // Mostra a mensagem "Exiting..."
+						fmt.Println(output) 
 						a.Stop()
 						return nil
 					}
-					fmt.Fprintf(os.Stderr, "Error executing internal command: %v\nOutput:\n%s\n", err, output)
+					// Imprimir erro e saída para o usuário
+					fmt.Fprintf(os.Stderr, "Error executing internal command: %v\n", err)
+					fmt.Print(output)
 				} else {
-					fmt.Print(output) // Mostra a saída do comando interno diretamente
+					fmt.Print(output) // Mostra a saída diretamente
 				}
 			}
 
@@ -297,8 +290,42 @@ func (a *Agent) executeInternalCommand(ctx context.Context, commandLine string) 
 	return outputBuf.String(), execErr
 }
 
+// --- Função Auxiliar para Parsing Robusto ---
+func extractJsonBlock(rawResponse string) (string, error) {
+	// Tentativa 1: Remover espaços em branco e verificar se é JSON válido diretamente
+	trimmed := strings.TrimSpace(rawResponse)
+	if (strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}")) || 
+	   (strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]")) {
+		if json.Valid([]byte(trimmed)) {
+			return trimmed, nil
+		}
+	}
+
+	// Tentativa 2: Encontrar o primeiro '{' e o último '}'
+	firstBrace := strings.Index(rawResponse, "{")
+	lastBrace := strings.LastIndex(rawResponse, "}")
+	if firstBrace != -1 && lastBrace != -1 && lastBrace > firstBrace {
+		extracted := rawResponse[firstBrace : lastBrace+1]
+		if json.Valid([]byte(extracted)) {
+			log.Println("[Debug] Extracted JSON block using first/last brace.")
+			return extracted, nil
+		}
+	}
+
+	// Tentativa 3: Regex mais simples (pode ser frágil)
+	// jsonRegex := regexp.MustCompile(`(?s){.*}`) // Regex simples
+	// match := jsonRegex.FindString(rawResponse)
+	// if match != "" && json.Valid([]byte(match)) {
+	// 	log.Println("[Debug] Extracted JSON block using simple regex.")
+	// 	return match, nil
+	// }
+
+	return "", fmt.Errorf("could not extract valid JSON block from LLM response")
+}
+
 // processAgentTurn collects context, calls LLM, and handles the response.
-func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput string, completedTask *task.Task, internalResult *InternalCommandResult) {
+// internalResult é o resultado de um comando interno executado NO TURNO ANTERIOR (solicitado pelo LLM)
+func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput string, completedTask *task.Task, internalResultOutput *string /* Alterado para *string */) {
 	
 	// --- Validação UTF-8 da entrada do usuário ---
 	if userInput != "" && !utf8.ValidString(userInput) {
@@ -320,7 +347,7 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 	}
 	// --- Fim da Validação UTF-8 ---
 
-	// 1. Construir o prompt para o LLM - AGORA COMO HISTÓRICO DE CONTEÚDO
+	// 1. Construir o prompt para o LLM
 	var currentTurnParts []genai.Part
 	contextInfo := bytes.NewBufferString("") 
 
@@ -328,24 +355,18 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 	a.mu.Lock()
 	lastFailure := a.lastActionFailure
 	a.lastActionFailure = nil 
-	// Incluir resultado do comando interno anterior
-	lastIntResult := a.lastInternalResult
-	a.lastInternalResult = nil // Limpa após incluir
 	a.mu.Unlock()
 	if lastFailure != nil {
 		fmt.Fprintf(contextInfo, "[Action Failed: %v]\n\n", lastFailure)
 		log.Printf("Including previous action failure in context: %v", lastFailure)
 	}
-	// Adiciona resultado do comando interno anterior ao contexto
-	if lastIntResult != nil {
+	// Adiciona resultado do comando interno *deste turno* (se houver)
+	if internalResultOutput != nil {
 		fmt.Fprintf(contextInfo, "[Internal Command Result]\n")
-		output := lastIntResult.Output
-		if len(output) > 1000 { output = output[:1000] + "\n... (output truncated)" } // Limita output
+		output := *internalResultOutput
+		if len(output) > 1000 { output = output[:1000] + "\n... (output truncated)" } 
 		fmt.Fprintf(contextInfo, "%s\n", output)
-		if lastIntResult.Error != nil {
-			// Não enviar o erro técnico, apenas a saída que pode conter a mensagem de erro
-			// fmt.Fprintf(contextInfo, "Error: %v\n", lastIntResult.Error) 
-		}
+		// Erro do comando interno já está implícito na saída (gerado por executeInternalCommand)
 		fmt.Fprintf(contextInfo, "[End Internal Command Result]\n\n")
 	}
 
@@ -385,8 +406,8 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 		log.Printf("--- Sending Task Result to LLM ---")
 		log.Printf("%s", taskResultText.String())
 		log.Printf("--- End Task Result ---")
-	} else {
-		log.Println("Warning: processAgentTurn called without user input or completed task/internal result.")
+	} else if internalResultOutput == nil && userInput == "" { // Modificado: só aviso se não houver NADA
+		log.Println("Warning: processAgentTurn called without user input or task/internal result.")
 		return 
 	}
 
@@ -427,22 +448,36 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 		return
 	}
 
-	// 3. Parse LLM Response
-	var agentResp AgentResponse
+	// 3. Parse LLM Response (AGORA COMO TEXTO -> JSON)
+	var parsedResp ParsedLLMResponse
 	processed := false
-	// ... (lógica de parseamento JSON como antes) ...
+	rawResponseText := ""
+
 	if resp != nil && len(resp.Candidates) > 0 && resp.Candidates[0].Content != nil && len(resp.Candidates[0].Content.Parts) > 0 {
-		part := resp.Candidates[0].Content.Parts[0]
-		if txt, ok := part.(genai.Text); ok {
-			jsonData := []byte(txt)
-			if err := json.Unmarshal(jsonData, &agentResp); err == nil {
-				processed = true
-				fmt.Printf("[LLM Response Parsed: %+v]\n", agentResp)
+		// Assumir que a resposta está na primeira parte e é texto
+		if txt, ok := resp.Candidates[0].Content.Parts[0].(genai.Text); ok {
+			rawResponseText = string(txt)
+			log.Printf("[LLM Raw Text Response]:\n%s\n--------------------", rawResponseText)
+
+			jsonBlock, err := extractJsonBlock(rawResponseText)
+			if err != nil {
+				log.Printf("Error extracting JSON from LLM response: %v", err)
+				// TODO: Considerar enviar erro de volta ao LLM no próximo turno?
 			} else {
-				log.Printf("Error unmarshaling direct JSON response: %v\nJSON received: %s", err, string(jsonData))
+				if err := json.Unmarshal([]byte(jsonBlock), &parsedResp); err == nil {
+					// Validação básica da estrutura parseada
+					if parsedResp.Type == "" || parsedResp.Message == "" {
+						log.Printf("Warning: Parsed JSON missing mandatory fields 'type' or 'message'. JSON: %s", jsonBlock)
+					} else {
+						processed = true
+						fmt.Printf("[LLM Response Parsed: %+v]\n", parsedResp)
+					}
+				} else {
+					log.Printf("Error unmarshaling extracted JSON block: %v\nJSON Block:\n%s", err, jsonBlock)
+				}
 			}
 		} else {
-			log.Printf("Warning: Expected genai.Text part for JSON response, but got %T", part)
+			log.Printf("Warning: Expected genai.Text part in LLM response, but got %T", resp.Candidates[0].Content.Parts[0])
 		}
 	} else {
 		log.Printf("Warning: Could not process LLM response structure. Resp: %+v", resp)
@@ -456,49 +491,60 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 	}
 
 	if !processed {
-		log.Println("Warning: Could not process LLM response content.")
-		if agentResp.Msg == "" { 
-		    agentResp.Msg = "[Agent Error: Could not process response content. Please check agent logs.]"
+		log.Println("Warning: Failed to process LLM response into valid JSON structure.")
+		// Gera uma mensagem de erro padrão se o parse falhar e não houver mensagem
+		if parsedResp.Message == "" {
+			parsedResp.Message = fmt.Sprintf("[Agent Error: Could not understand the response format. Please check agent logs. Raw response: %s]", rawResponseText) 
+			if len(parsedResp.Message) > 500 { // Truncar raw response no erro
+				parsedResp.Message = parsedResp.Message[:500] + "...]"
+			}
 		}
+		parsedResp.Type = "response" // Força tipo response em caso de erro de parse
 	}
 
 	// 4. Execute Action
-	if agentResp.Msg != "" {
-		fmt.Printf("[Agent]: %s\n", agentResp.Msg)
+	if parsedResp.Message != "" {
+		fmt.Printf("[Agent]: %s\n", parsedResp.Message)
 	}
 
-	if agentResp.Cmd != "" {
-		if strings.HasPrefix(agentResp.Cmd, "/") {
+	switch parsedResp.Type {
+	case "command", "internal_command":
+		if parsedResp.CommandDetails == nil || parsedResp.CommandDetails.Command == "" {
+			log.Println("Error: LLM response type is command/internal_command but command_details.command is missing or empty.")
+			fmt.Println("[Agent]: I intended to run a command, but I didn't specify which one correctly.")
+			break
+		}
+		cmdToRun := parsedResp.CommandDetails.Command
+		if parsedResp.Type == "internal_command" {
 			// --- LLM solicitou comando interno --- 
-			fmt.Printf("[Executing Internal Command (LLM): %s]\n", agentResp.Cmd)
-			output, err := a.executeInternalCommand(ctx, agentResp.Cmd)
+			fmt.Printf("[Executing Internal Command (LLM): %s]\n", cmdToRun)
+			output, err := a.executeInternalCommand(ctx, cmdToRun)
 			
-			// Guarda o resultado para o próximo turno
-			a.mu.Lock()
-			a.lastInternalResult = &InternalCommandResult{Output: output, Error: err}
-			a.mu.Unlock()
-
 			if err != nil {
 				if errors.Is(err, commands.ErrExitRequested) {
-					// LLM pediu para sair
-					fmt.Println(output) // Mostra a saída do comando exit
+					fmt.Println(output) 
 					a.Stop()
-					return // Encerra o turno aqui
+					return 
 				}
-				// Loga o erro, o resultado (incluindo a msg de erro) será enviado no próximo turno
 				log.Printf("Error executing internal command requested by LLM: %v", err)
+				// O erro está incluído na 'output', que será enviada na chamada recursiva
 			}
-			// Não fazer mais nada neste turno, esperar o próximo para enviar o resultado
+			
+			// <<< CHAMADA RECURSIVA >>>
+			// Chama processAgentTurn imediatamente com o resultado do comando interno
+			log.Printf("Internal command executed, immediately calling agent turn with its result.")
+			a.processAgentTurn(ctx, "internal_command_result", "", nil, &output)
+			return // Retorna para não continuar o fluxo normal deste turno
 
 		} else {
 			// --- LLM solicitou comando externo --- 
-			fmt.Printf("[Submitting Task: %s]\n", agentResp.Cmd)
+			fmt.Printf("[Submitting Task: %s]\n", cmdToRun)
 			isInteractive := false // TODO: decideIfInteractive
-			taskID, err := a.execManager.SubmitTask(ctx, agentResp.Cmd, isInteractive)
+			taskID, err := a.execManager.SubmitTask(ctx, cmdToRun, isInteractive)
 			if err != nil {
-				failureMsg := fmt.Errorf("SubmitTask failed for command '%s': %w", agentResp.Cmd, err)
+				failureMsg := fmt.Errorf("SubmitTask failed for command '%s': %w", cmdToRun, err)
 				fmt.Fprintf(os.Stderr, "%v\n", failureMsg)
-				fmt.Printf("[Agent]: Failed to start command: %s\n", agentResp.Cmd)
+				fmt.Printf("[Agent]: Failed to start command: %s\n", cmdToRun)
 				a.mu.Lock()
 				a.lastActionFailure = failureMsg // Guarda a falha
 				a.mu.Unlock()
@@ -509,37 +555,38 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 				a.mu.Unlock()
 			}
 		}
-	} else if agentResp.Signal != "" {
-		sig := mapSignal(agentResp.Signal)
+	case "signal":
+		if parsedResp.SignalDetails == nil || parsedResp.SignalDetails.Signal == "" || parsedResp.SignalDetails.TaskID == "" {
+			log.Println("Error: LLM response type is signal but signal_details or its fields are missing or empty.")
+			fmt.Println("[Agent]: I intended to send a signal, but I didn't specify the signal or target task correctly.")
+			break
+		}
+		signalName := parsedResp.SignalDetails.Signal
+		targetTaskID := parsedResp.SignalDetails.TaskID
+		sig := mapSignal(signalName)
 		if sig == nil {
-			fmt.Fprintf(os.Stderr, "Unknown signal in LLM response: %s\n", agentResp.Signal)
-			fmt.Printf("[Agent]: I don't recognize the signal '%s'.\n", agentResp.Signal)
-			return
+			fmt.Fprintf(os.Stderr, "Unknown signal in LLM response: %s\n", signalName)
+			fmt.Printf("[Agent]: I don't recognize the signal '%s'.\n", signalName)
+			break
 		}
 		
-		targetTaskID := agentResp.TaskID
-		if targetTaskID == "" {
-			a.mu.Lock()
-			targetTaskID = a.lastSubmittedTaskID // Tenta usar a última tarefa se nenhuma for especificada
-			a.mu.Unlock()
-		}
-		if targetTaskID == "" {
-			fmt.Fprintf(os.Stderr, "Signal requested but no target task ID specified or known.\n")
-			fmt.Printf("[Agent]: I need to know which command (task ID) to send the signal '%s' to.\n", agentResp.Signal)
-			return
-		}
-
 		fmt.Printf("[Sending Signal %v to Task %s]\n", sig, targetTaskID)
 		err := a.execManager.SendSignalToTask(targetTaskID, sig)
 		if err != nil {
 			failureMsg := fmt.Errorf("SendSignal(%v) failed for task '%s': %w", sig, targetTaskID, err)
 			fmt.Fprintf(os.Stderr, "%v\n", failureMsg)
-			fmt.Printf("[Agent]: Failed to send signal %s to task %s. %v\n", agentResp.Signal, targetTaskID, err)
+			fmt.Printf("[Agent]: Failed to send signal %s to task %s. %v\n", signalName, targetTaskID, err)
 			a.mu.Lock()
 			a.lastActionFailure = failureMsg // Guarda a falha
 			a.mu.Unlock()
 		} 
-	} 
+	case "response":
+		// Nenhuma ação adicional necessária, apenas a mensagem já foi impressa.
+		break
+	default:
+		log.Printf("Warning: Unknown LLM response type: %s", parsedResp.Type)
+		fmt.Printf("[Agent]: I generated an unexpected response type: %s\n", parsedResp.Type)
+	}
 
 	// 5. Update history é tratado automaticamente pelo chatSession.SendMessage
 
