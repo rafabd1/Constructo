@@ -140,9 +140,35 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		log.Printf("[TUI Received TaskMsg]: Type=%s ID=%s", msg.Event.EventType, msg.Event.TaskID[:8])
 		eventStr := formatTaskEvent(msg.Event)
 		m.messages = append(m.messages, m.taskStyle.Render(eventStr))
+		
+		// Exibir Output Buffer em caso de conclusão
+		if msg.Event.EventType == "completed" {
+			// Buscar o estado completo da tarefa para obter o buffer
+			finalTaskStatus, err := m.taskManager.GetTaskStatus(msg.Event.TaskID)
+			if err != nil {
+				log.Printf("[TUI Update TaskMsg]: Error getting final status for task %s: %v", msg.Event.TaskID, err)
+				m.messages = append(m.messages, m.errorStyle.Render(fmt.Sprintf("  (Could not retrieve final output for task %s)", msg.Event.TaskID[:8])))
+			} else if finalTaskStatus.OutputBuffer != nil {
+				outputStr := finalTaskStatus.OutputBuffer.String()
+				if outputStr != "" {
+					maxLen := 500 
+					separator := "\n-------------------- Task Output End --------------------\n"
+					if len(outputStr) > maxLen {
+						outputStr = outputStr[:maxLen] + "\n... (output truncated)"
+					}
+					m.messages = append(m.messages, lipgloss.NewStyle().Faint(true).Render(outputStr)+separator)
+				}
+			}
+		}
+
 		m.viewport.SetContent(strings.Join(m.messages, "\n"))
-		// m.viewport.GotoBottom() // Manter comentado
+		// m.viewport.GotoBottom() 
 		return m, nil
+
+	// Case para receber sinal de saída do Agent
+	case events.ExitTUIMsg:
+		log.Println("[TUI Received ExitMsg]: Quit signal received from agent.")
+		return m, tea.Quit // Retorna comando para sair do Bubble Tea
 	}
 
 	return m, tea.Batch(vpCmd, taCmd)

@@ -18,10 +18,14 @@ type TaskTuiMsg struct {
 	// ou adicionar campos específicos para a TUI.
 }
 
+// ExitTUIMsg é enviada pelo Agent para sinalizar que a TUI deve encerrar.
+type ExitTUIMsg struct{}
+
 // Compile-time check to ensure our messages implement tea.Msg
 // (Embora structs vazias/simples não precisem de métodos para implementar interface vazia)
 var _ tea.Msg = AgentOutputMsg{}
 var _ tea.Msg = TaskTuiMsg{}
+var _ tea.Msg = ExitTUIMsg{}
 
 // -- Poderíamos mover a definição de TaskEvent para cá também --
 /*

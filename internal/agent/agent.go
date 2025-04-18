@@ -411,7 +411,7 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 				if errors.Is(err, commands.ErrExitRequested) {
 					// Envia output ("Exiting...") e pede para parar
 					a.sendToTUI(events.AgentOutputMsg{Content: output})
-					a.Stop()
+					a.sendToTUI(events.ExitTUIMsg{})
 					return 
 				}
 				log.Printf("Error executing internal command requested by LLM: %v", err)
@@ -510,12 +510,12 @@ func (a *Agent) ProcessUserInput(input string) {
 	if isInternal {
 		// Executar comando interno diretamente e enviar saída para TUI
 		go func() {
-			a.sendToTUI(events.AgentOutputMsg{Content: fmt.Sprintf("[Executing Internal Command: %s]", input)}) // Informa TUI
+			a.sendToTUI(events.AgentOutputMsg{Content: fmt.Sprintf("[Executing Internal Command: %s]", input)})
 			output, err := a.executeInternalCommand(a.ctx, input)
 			if err != nil {
 				if errors.Is(err, commands.ErrExitRequested) {
 					a.sendToTUI(events.AgentOutputMsg{Content: output})
-					a.Stop()
+					a.sendToTUI(events.ExitTUIMsg{})
 					return 
 				}
 				// Envia erro e output para TUI
