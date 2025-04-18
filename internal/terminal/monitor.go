@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"time"
 )
 
 // Monitor reads from a Pty output and distributes it.
@@ -51,16 +52,27 @@ func (m *Monitor) run() {
 		case <-m.done:
 			return // Stop requested
 		default:
+			// Espera por mais dados ou sinal de parada
+			// Timeout pode ser adicionado aqui para flush periódico
+			select {
+			case <-time.After(100 * time.Millisecond): // Exemplo de timeout
+			case <-m.done:
+				return // Stop requested
+			}
+
+			// Ler do PTY
 			n, err := m.pty.Read(buf)
 			if n > 0 {
-				log.Printf("[Monitor Raw Read]: %q", string(buf[:n]))
+				// Processar dados lidos (enviar para o Writer)
 				m.mu.Lock()
-				output := m.output
+				writer := m.output
 				m.mu.Unlock()
 
-				if output != nil {
-					if _, writeErr := output.Write(buf[:n]); writeErr != nil {
-						fmt.Printf("Monitor write error: %v\n", writeErr)
+				if writer != nil {
+					_, writeErr := writer.Write(buf[:n])
+					if writeErr != nil {
+						log.Printf("Error writing PTY output to writer: %v", writeErr)
+						// O que fazer aqui? Parar o monitor? Apenas logar?
 					}
 				}
 			}

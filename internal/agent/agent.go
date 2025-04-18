@@ -180,18 +180,16 @@ func (a *Agent) Run(ctx context.Context) error {
 			return nil
 
 		case line := <-a.userInputChan:
-			isInternal, isLog := a.parseUserInput(line) // Modificado para retornar se é log
+			isInternal, isLog := a.parseUserInput(line)
 			if isLog {
-				// Ignorar logs
 				continue
 			}
 			if !isInternal {
-				// É input para o LLM
-				a.processAgentTurn(ctx, "user_input", line, nil, nil) // Último nil: internalResult
+				a.processAgentTurn(ctx, "user_input", line, nil, nil)
 			} else {
-				// Usuário digitou um comando interno diretamente
-				fmt.Printf("[Executing Internal Command (User): %s]\n", line)
-				output, err := a.executeInternalCommand(ctx, line) 
+				// Não logar execução interna aqui, o comando interno pode logar se necessário
+				// fmt.Printf("[Executing Internal Command (User): %s]\n", line)
+				output, err := a.executeInternalCommand(ctx, line)
 				if err != nil {
 					if errors.Is(err, commands.ErrExitRequested) {
 						fmt.Println(output) 
@@ -207,21 +205,18 @@ func (a *Agent) Run(ctx context.Context) error {
 			}
 
 		case event := <-a.execManager.Events():
+			// Manter este log, é útil para saber o que o manager está fazendo
 			log.Printf("[TaskManager Event]: ID=%s Type=%s Status=%s Err=%v", event.TaskID, event.EventType, event.Status, event.Error)
 			if event.EventType == "completed" {
 				taskStatus, err := a.execManager.GetTaskStatus(event.TaskID)
 				if err != nil {
-					log.Printf("Error getting status for completed task %s: %v", event.TaskID, err)
-					// Decide o que fazer - talvez informar o LLM sobre o erro?
+					log.Printf("Error getting status for completed task %s: %v", event.TaskID, err) // Manter log de erro
 					continue
 				}
-				a.processAgentTurn(ctx, "task_completed", "", taskStatus, nil) // Passa nil para internalResult
+				a.processAgentTurn(ctx, "task_completed", "", taskStatus, nil)
 			} else if event.EventType == "error" {
-				// Lidar com erros específicos do gerenciador, se houver
-				log.Printf("Execution manager reported error for task %s: %v", event.TaskID, event.Error)
-				// Talvez informar o LLM
+				log.Printf("Execution manager reported error for task %s: %v", event.TaskID, event.Error) // Manter log de erro
 			}
-			// TODO: Lidar com eventos "output" se quisermos streaming
 		}
 	}
 }
@@ -259,18 +254,16 @@ func (a *Agent) readUserInput() {
 // parseUserInput verifica se a linha é um comando interno ou log.
 // Retorna (isInternal, isLog).
 func (a *Agent) parseUserInput(line string) (bool, bool) {
-	// Filtro de log (como antes)
 	logPattern := `^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}`
 	matched, _ := regexp.MatchString(logPattern, line)
-	if matched || strings.HasPrefix(line, "[") || strings.Contains(line, "--- Sending") || strings.Contains(line, "Trigger:") || strings.Contains(line, "Task Result - ID:") || strings.Contains(line, "Action Failed:") {
-		return false, true // É log, não é comando interno
+	// Simplificar a condição de log
+	if matched || strings.HasPrefix(line, "[") {
+		return false, true
 	}
-
 	if strings.HasPrefix(line, "/") {
-		return true, false // É comando interno, não é log
+		return true, false
 	}
-
-	return false, false // Não é comando interno nem log (é input para LLM)
+	return false, false
 }
 
 // executeInternalCommand executa um comando interno e retorna sua saída e erro.
@@ -325,7 +318,7 @@ func extractJsonBlock(rawResponse string) (string, error) {
 
 // processAgentTurn collects context, calls LLM, and handles the response.
 // internalResult é o resultado de um comando interno executado NO TURNO ANTERIOR (solicitado pelo LLM)
-func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput string, completedTask *task.Task, internalResultOutput *string /* Alterado para *string */) {
+func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput string, completedTask *task.Task, internalResultOutput *string) {
 	
 	// --- Validação UTF-8 da entrada do usuário ---
 	if userInput != "" && !utf8.ValidString(userInput) {
@@ -415,9 +408,6 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 	builtContext := contextInfo.String()
 	if builtContext != "" {
 		currentTurnParts = append(currentTurnParts, genai.Text(builtContext))
-		log.Printf("--- Sending Prompt Context to LLM ---")
-		log.Printf("%s", builtContext)
-		log.Printf("--- End Prompt Context ---")
 	} else {
 		log.Println("[Debug] Skipping agent turn: No effective prompt parts generated.")
 		return
@@ -429,9 +419,7 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 	}
 
 	// 2. Call LLM
-	fmt.Println("[Calling Gemini...] ")
-
-	// Envia as partes da *rodada atual*. O chatSession mantém o histórico anterior.
+	fmt.Println("[Calling Gemini...]")
 	resp, err := a.chatSession.SendMessage(ctx, currentTurnParts...)
 	if err != nil {
 		log.Printf("Error calling Gemini: %v", err)
@@ -457,12 +445,9 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 		// Assumir que a resposta está na primeira parte e é texto
 		if txt, ok := resp.Candidates[0].Content.Parts[0].(genai.Text); ok {
 			rawResponseText = string(txt)
-			log.Printf("[LLM Raw Text Response]:\n%s\n--------------------", rawResponseText)
-
 			jsonBlock, err := extractJsonBlock(rawResponseText)
 			if err != nil {
 				log.Printf("Error extracting JSON from LLM response: %v", err)
-				// TODO: Considerar enviar erro de volta ao LLM no próximo turno?
 			} else {
 				if err := json.Unmarshal([]byte(jsonBlock), &parsedResp); err == nil {
 					// Validação básica da estrutura parseada
@@ -470,7 +455,6 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 						log.Printf("Warning: Parsed JSON missing mandatory fields 'type' or 'message'. JSON: %s", jsonBlock)
 					} else {
 						processed = true
-						fmt.Printf("[LLM Response Parsed: %+v]\n", parsedResp)
 					}
 				} else {
 					log.Printf("Error unmarshaling extracted JSON block: %v\nJSON Block:\n%s", err, jsonBlock)

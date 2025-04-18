@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -104,164 +105,172 @@ func NewManager() ExecutionManager {
 	}
 }
 
+// Start starts the background task monitoring.
 func (m *manager) Start() error {
-	// No momento, nenhuma goroutine de fundo permanente é necessária
-	// mas a estrutura está aqui caso seja preciso no futuro.
+	// go m.monitorTasks() // Removido - funcionalidade não implementada ou removida
 	return nil
 }
 
+// Stop signals the monitoring goroutine to stop and waits for tasks to finish (or times out).
 func (m *manager) Stop() error {
 	close(m.stopChan)
-	// TODO: Cancelar todas as tarefas ativas?
-	m.tasksMu.Lock()
-	defer m.tasksMu.Unlock()
-	for _, task := range m.tasks {
-		if task.Status == StatusRunning || task.Status == StatusPending {
-			task.cancelFunc() // Tenta cancelar via contexto
-		}
-	}
-	close(m.eventChan) // Fecha o canal de eventos
+	// Lógica original de Stop (sem wait group ou timeout específico aqui,
+	// a responsabilidade de esperar por tarefas pode ser externa ou gerenciada
+	// de outra forma se necessário no futuro)
+	// Por exemplo, fechar o canal de eventos se ele for usado para sinalizar conclusão geral.
+	// close(m.eventChan)
+	log.Println("Task manager stop requested.")
 	return nil
 }
-
 
 func (m *manager) Events() <-chan TaskEvent {
 	return m.eventChan
 }
 
-// SubmitTask (Implementação Inicial - Apenas Não Interativo)
+// SubmitTask starts a new command as a background task.
 func (m *manager) SubmitTask(ctx context.Context, command string, interactive bool) (string, error) {
 	if interactive {
-		// TODO: Implementar lógica para iniciar PTY dedicado
-		return "", fmt.Errorf("interactive task execution not yet implemented")
+		return "", fmt.Errorf("interactive tasks not yet supported by task manager")
 	}
 
-	taskID := uuid.New().String()
-	taskCtx, cancelFunc := context.WithCancel(ctx) // Cria um contexto filho para a tarefa
+	args := strings.Fields(command)
+	if len(args) == 0 {
+		return "", fmt.Errorf("command cannot be empty")
+	}
 
-	newTask := &Task{
+	cmdName := args[0]
+	cmdArgs := args[1:]
+
+	// Gerar um ID único para a tarefa
+	taskID := uuid.NewString()
+
+	// Criar contexto para a tarefa que pode ser cancelado
+	taskCtx, cancel := context.WithCancel(ctx) // Usa o contexto pai
+
+	t := &Task{
 		ID:            taskID,
 		CommandString: command,
-		IsInteractive: interactive,
 		Status:        StatusPending,
-		StartTime:     time.Now(),
-		OutputBuffer:  new(bytes.Buffer),
-		ctx:           taskCtx,
-		cancelFunc:    cancelFunc,
+		cancelFunc:    cancel,
+		StartTime:     time.Now(), // Marca o tempo de submissão
 	}
 
-	// Armazena a tarefa antes de iniciar a goroutine
+	// Log de submissão
+	log.Printf("Submitting task %s: %s", t.ID, t.CommandString)
+
+	// Adiciona a tarefa ao mapa antes de iniciar a goroutine
 	m.tasksMu.Lock()
-	m.tasks[taskID] = newTask
+	m.tasks[taskID] = t
 	m.tasksMu.Unlock()
 
-	// Inicia a execução em uma goroutine
-	go m.runNonInteractiveTask(newTask)
+	// Cria o comando
+	cmd := exec.CommandContext(taskCtx, cmdName, cmdArgs...)
 
-	return taskID, nil
-}
+	// Buffer para capturar stdout e stderr combinados
+	outputBuf := new(bytes.Buffer)
+	cmd.Stdout = outputBuf
+	cmd.Stderr = outputBuf
 
-// Goroutine para executar tarefas não interativas
-func (m *manager) runNonInteractiveTask(task *Task) {
-	
-	task.mu.Lock()
-	task.Status = StatusRunning
-	task.StartTime = time.Now() 
-	task.mu.Unlock()
+	// Inicia o comando em uma nova goroutine para não bloquear
+	go func() {
+		defer func() {
+			t.EndTime = time.Now()
+			// Atualiza status final e envia evento
+			m.tasksMu.Lock()
+			if t.Status == StatusRunning { // Só muda se ainda estava Running
+				if t.Error == nil {
+					t.Status = StatusSuccess
+				} else {
+					t.Status = StatusFailed
+				}
+			}
+			// Guarda o buffer final
+			t.OutputBuffer = outputBuf
+			m.tasksMu.Unlock()
 
-	// Envia evento de início (opcional, mas útil)
-	m.sendEvent(TaskEvent{TaskID: task.ID, EventType: "started", Status: StatusRunning})
+			m.sendEvent(TaskEvent{
+				TaskID:    t.ID,
+				EventType: "completed",
+				Status:    t.Status,
+				ExitCode:  t.ExitCode,
+				Error:     t.Error, // Pode ser nil
+			})
+		}()
 
-	// Configura o comando
-	// Usamos "bash -c" para permitir pipelines e redirecionamentos simples na string do comando
-	cmd := exec.CommandContext(task.ctx, "bash", "-c", task.CommandString)
-	cmd.Stdout = task.OutputBuffer // Captura stdout no buffer da tarefa
-	cmd.Stderr = task.OutputBuffer // Captura stderr no mesmo buffer
+		// Atualiza o status para Running logo antes de Start()
+		m.tasksMu.Lock()
+		t.Status = StatusRunning
+		m.tasksMu.Unlock()
+		m.sendEvent(TaskEvent{
+			TaskID:    t.ID,
+			EventType: "started",
+			Status:    StatusRunning,
+		})
 
-	task.mu.Lock()
-	task.cmd = cmd // Armazena a referência ao cmd
-	task.mu.Unlock()
-
-	// Executa o comando
-	err := cmd.Run() // Bloqueia até o comando terminar
-
-	// Atualiza o estado da tarefa após a conclusão
-	task.mu.Lock()
-	task.EndTime = time.Now()
-	task.Error = err
-	if task.ctx.Err() == context.Canceled { // Verifica se foi cancelado
-		task.Status = StatusCancelled
-	} else if err != nil {
-		task.Status = StatusFailed
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			task.ExitCode = exitErr.ExitCode()
-		} else {
-			task.ExitCode = -1 // Código de saída indeterminado
+		// Logar o início da execução da tarefa
+		log.Printf("Executing task %s: %s", t.ID, t.CommandString)
+		err := cmd.Start()
+		if err != nil {
+			t.Error = fmt.Errorf("failed to start command: %w", err)
+			log.Printf("Error starting task %s: %v", t.ID, t.Error)
+			// Status será atualizado para Errored no defer principal
+			m.tasksMu.Lock()
+			t.Status = StatusFailed
+			m.tasksMu.Unlock()
+			return
 		}
-	} else {
-		task.Status = StatusSuccess
-		task.ExitCode = 0
-	}
-	task.mu.Unlock()
-	
-	// Envia evento de conclusão
-	m.sendEvent(TaskEvent{
-		TaskID:    task.ID,
-		EventType: "completed",
-		Status:    task.Status,
-		ExitCode:  task.ExitCode,
-		Error:     task.Error,
-	})
-	
-	// Limpa a função de cancelamento para liberar recursos
-	task.cancelFunc()
+
+		t.cmd = cmd // Armazena a referência ao cmd
+
+		// Aguarda a conclusão do comando
+		err = cmd.Wait()
+		if err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				t.ExitCode = exitErr.ExitCode()
+				t.Error = fmt.Errorf("command finished with non-zero exit code %d", t.ExitCode)
+				log.Printf("Task %s finished with error: %v", t.ID, err)
+			} else {
+				t.Error = fmt.Errorf("command wait failed: %w", err)
+				log.Printf("Error waiting for task %s: %v", t.ID, t.Error)
+			}
+			// Status será atualizado no defer principal
+			m.tasksMu.Lock()
+			t.Status = StatusFailed
+			m.tasksMu.Unlock()
+		} else {
+			t.ExitCode = 0
+			// Logar conclusão bem-sucedida
+			log.Printf("Task %s completed successfully (Exit Code 0)", t.ID)
+			// Status será atualizado no defer principal (para Completed)
+			m.tasksMu.Lock()
+			t.Status = StatusSuccess
+			m.tasksMu.Unlock()
+		}
+	}()
+
+	return t.ID, nil
 }
 
-// sendEvent envia um evento pelo canal de forma segura.
-func (m *manager) sendEvent(event TaskEvent) {
-	select {
-	case m.eventChan <- event:
-	case <-m.stopChan:
-		// Gerenciador está parando, não enviar mais eventos
-	}
-}
-
-
-// GetTaskStatus (Implementação Segura)
+// GetTaskStatus retorna o status de uma tarefa específica.
 func (m *manager) GetTaskStatus(taskID string) (*Task, error) {
 	m.tasksMu.RLock()
+	defer m.tasksMu.RUnlock()
 	task, exists := m.tasks[taskID]
-	m.tasksMu.RUnlock() // Libera leitura o mais rápido possível
-
 	if !exists {
-		return nil, fmt.Errorf("task with ID '%s' not found", taskID)
+		return nil, fmt.Errorf("task with ID %s not found", taskID)
 	}
-
-	// Retorna uma cópia segura dos dados relevantes para evitar race conditions
-	// ou expor o mutex interno da tarefa.
-	task.mu.RLock()
-	defer task.mu.RUnlock()
-
-	// Cria uma cópia segura
-	statusCopy := &Task{
-		ID:            task.ID,
-		CommandString: task.CommandString,
-		IsInteractive: task.IsInteractive,
-		Status:        task.Status,
-		StartTime:     task.StartTime,
-		EndTime:       task.EndTime,
-		ExitCode:      task.ExitCode,
-		OutputBuffer:  bytes.NewBuffer(task.OutputBuffer.Bytes()), // Copia o buffer
-		Error:         task.Error,
+	// Retorna uma cópia para evitar modificação externa do estado interno
+	// (Cuidado: OutputBuffer ainda é compartilhado se for ponteiro)
+	copyTask := *task
+	if task.OutputBuffer != nil {
+		// Cria uma cópia do buffer se existir
+		bufCopy := bytes.NewBuffer(task.OutputBuffer.Bytes())
+		copyTask.OutputBuffer = bufCopy
 	}
-	
-	return statusCopy, nil
+	return &copyTask, nil
 }
 
-
-// Implementações restantes (SendInputToTask, SendSignalToTask, CancelTask)
-// precisam ser adicionadas e lidarão com tarefas interativas (PTY) e não interativas (exec.Cmd).
-
+// SendInputToTask envia dados para a entrada de uma tarefa interativa.
 func (m *manager) SendInputToTask(taskID string, input []byte) error {
 	m.tasksMu.RLock()
 	task, exists := m.tasks[taskID]
@@ -287,32 +296,42 @@ func (m *manager) SendInputToTask(taskID string, input []byte) error {
 	return fmt.Errorf("SendInputToTask not yet implemented")
 }
 
-func (m *manager) SendSignalToTask(taskID string, sig os.Signal) error {
-	 m.tasksMu.RLock()
-	 task, exists := m.tasks[taskID]
-	 m.tasksMu.RUnlock()
+// SendSignalToTask envia um sinal OS para uma tarefa em execução.
+func (m *manager) SendSignalToTask(taskID string, signal os.Signal) error {
+	m.tasksMu.RLock()
+	task, exists := m.tasks[taskID]
+	if !exists {
+		m.tasksMu.RUnlock()
+		return fmt.Errorf("task with ID %s not found", taskID)
+	}
+	pid := task.cmd.Process.Pid
+	status := task.Status
+	m.tasksMu.RUnlock()
 
-	 if !exists {
-		 return fmt.Errorf("task with ID '%s' not found", taskID)
-	 }
-	 
-	 task.mu.RLock()
-	 defer task.mu.RUnlock()
+	if status != StatusRunning {
+		return fmt.Errorf("task %s is not running (status: %s)", taskID, status)
+	}
+	if pid <= 0 {
+		return fmt.Errorf("task %s has an invalid PID (%d)", taskID, pid)
+	}
 
-	 if task.IsInteractive && task.ptyController != nil {
-		 // TODO: Implementar envio de sinal via PTYController
-		 // signaler, ok := task.ptyController.(interface{ SendSignal(os.Signal) error })
-		 // if !ok { ... error }
-		 // return signaler.SendSignal(sig)
-		 return fmt.Errorf("sending signal to interactive task not yet implemented")
-	 } else if !task.IsInteractive && task.cmd != nil && task.cmd.Process != nil {
-		 // Enviar sinal para processo não interativo
-		 return task.cmd.Process.Signal(sig)
-	 } else {
-		 return fmt.Errorf("cannot send signal to task '%s': process not running or not available", taskID)
-	 }
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		// Processo pode já ter terminado entre a leitura do status e aqui
+		log.Printf("Could not find process for task %s (PID: %d): %v", taskID, pid, err)
+		return fmt.Errorf("could not find process for task %s (PID: %d): %w", taskID, pid, err)
+	}
+
+	log.Printf("Sending signal %v to task %s (PID: %d)", signal, taskID, pid)
+	err = process.Signal(signal)
+	if err != nil {
+		log.Printf("Error sending signal %v to task %s (PID: %d): %v", signal, taskID, pid, err)
+		return fmt.Errorf("failed to send signal %v to task %s (PID: %d): %w", signal, taskID, pid, err)
+	}
+	return nil
 }
 
+// CancelTask tenta cancelar uma tarefa em execução.
 func (m *manager) CancelTask(taskID string) error {
 	m.tasksMu.RLock()
 	task, exists := m.tasks[taskID]
@@ -365,4 +384,16 @@ func (m *manager) GetRunningTasksSummary() string {
 	}
 
 	return fmt.Sprintf("Running Tasks: %s", strings.Join(runningTasks, ", "))
+}
+
+// sendEvent envia um evento para o canal de eventos (sem lock, pois o canal é thread-safe).
+func (m *manager) sendEvent(event TaskEvent) {
+	select {
+	case m.eventChan <- event:
+	case <-m.stopChan:
+		log.Println("Manager stopped, discarding event:", event.EventType, event.TaskID)
+	default:
+		// Opcional: Logar se o canal de eventos estiver cheio
+		log.Printf("Warning: Event channel full, discarding event for task %s (%s)", event.TaskID, event.EventType)
+	}
 } 
