@@ -1,15 +1,20 @@
 package commands
 
-import "context"
+import (
+	"context"
+	"fmt"
+	"io"
+)
 
 // JudgeCmd implements the /judge command.
 type JudgeCmd struct {
-	// Needs access to the AI judge system (e.g., internal/judge.Judge)
+	// Needs access to the judge system
 }
 
 func (c *JudgeCmd) Name() string        { return "judge" }
-func (c *JudgeCmd) Description() string { return "Manually triggers the AI Judge to evaluate the current context." }
-func (c *JudgeCmd) Execute(ctx context.Context, args []string) error {
-	// Implementation to trigger the AI judge evaluation
-	return nil // Placeholder
+func (c *JudgeCmd) Description() string { return "Triggers the AI Judge to evaluate the current context/plan." }
+func (c *JudgeCmd) Execute(ctx context.Context, args []string, output io.Writer) error {
+	// Placeholder implementation
+	fmt.Fprintln(output, "Judge command not yet implemented.")
+	return nil
 } 

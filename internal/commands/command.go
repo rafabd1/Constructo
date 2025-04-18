@@ -1,12 +1,16 @@
 package commands
 
-import "context"
+import (
+	"context"
+	"io"
+)
 
 // Command defines the interface for executable slash commands.
 type Command interface {
-	Name() string                               // Returns the command name (e.g., "help")
-	Description() string                        // Returns a brief description
-	Execute(ctx context.Context, args []string) error // Executes the command
+	Name() string        // Returns the command name (e.g., "help")
+	Description() string // Returns a brief description
+	// Executes the command, writing output to the provided writer.
+	Execute(ctx context.Context, args []string, output io.Writer) error
 }
 
 // ContextKey is a type for context keys within the commands package.

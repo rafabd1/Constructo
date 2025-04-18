@@ -1,15 +1,20 @@
 package commands
 
-import "context"
+import (
+	"context"
+	"fmt"
+	"io"
+)
 
 // ReasonCmd implements the /reason command.
 type ReasonCmd struct {
-	// Needs access to the reasoning engine (e.g., internal/reasoning.Engine)
+	// Needs access to the reasoning engine
 }
 
 func (c *ReasonCmd) Name() string        { return "reason" }
-func (c *ReasonCmd) Description() string { return "Explicitly triggers the reasoning engine for a given query." }
-func (c *ReasonCmd) Execute(ctx context.Context, args []string) error {
-	// Implementation to take the query from args and call the reasoning engine
-	return nil // Placeholder
+func (c *ReasonCmd) Description() string { return "Triggers deep reasoning for a complex task." }
+func (c *ReasonCmd) Execute(ctx context.Context, args []string, output io.Writer) error {
+	// Placeholder implementation
+	fmt.Fprintln(output, "Reason command not yet implemented.")
+	return nil
 } 

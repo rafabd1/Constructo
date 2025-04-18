@@ -1,6 +1,10 @@
 package commands
 
-import "context"
+import (
+	"context"
+	"fmt"
+	"io"
+)
 
 // ConfigCmd implements the /config command.
 type ConfigCmd struct {
@@ -9,7 +13,8 @@ type ConfigCmd struct {
 
 func (c *ConfigCmd) Name() string        { return "config" }
 func (c *ConfigCmd) Description() string { return "Views or modifies agent configuration settings." }
-func (c *ConfigCmd) Execute(ctx context.Context, args []string) error {
-	// Implementation to view or modify configuration based on args
-	return nil // Placeholder
+func (c *ConfigCmd) Execute(ctx context.Context, args []string, output io.Writer) error {
+	// Placeholder implementation
+	fmt.Fprintln(output, "Config command not yet implemented.")
+	return nil
 } 

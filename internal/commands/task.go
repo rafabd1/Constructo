@@ -3,6 +3,7 @@ package commands
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -26,9 +27,10 @@ func (c *TaskCmd) Description() string {
 	return "Manages background tasks. Usage: /task status <task_id>"
 }
 
-func (c *TaskCmd) Execute(ctx context.Context, args []string) error {
+// Execute handles subcommands like 'status'.
+func (c *TaskCmd) Execute(ctx context.Context, args []string, output io.Writer) error {
 	if len(args) < 2 {
-		fmt.Println(c.Description())
+		fmt.Fprintln(output, c.Description()) // Usa output
 		return nil
 	}
 
@@ -37,6 +39,8 @@ func (c *TaskCmd) Execute(ctx context.Context, args []string) error {
 
 	execManager := c.ExecManagerProvider()
 	if execManager == nil {
+		// Escreve o erro no output também para o LLM ver
+		fmt.Fprintln(output, "Error: execution manager is not available")
 		return fmt.Errorf("execution manager is not available")
 	}
 
@@ -44,45 +48,44 @@ func (c *TaskCmd) Execute(ctx context.Context, args []string) error {
 	case "status":
 		taskInfo, err := execManager.GetTaskStatus(taskID)
 		if err != nil {
-			fmt.Printf("Error getting status for task %s: %v\n", taskID, err)
-			return nil // O erro é mostrado ao usuário, comando tratado
+			fmt.Fprintf(output, "Error getting status for task %s: %v\n", taskID, err) // Usa output
+			return nil 
 		}
 
-		// Imprime as informações formatadas
-		fmt.Printf("--- Task Status [%s] ---\n", taskInfo.ID)
-		fmt.Printf("Command: %s\n", taskInfo.CommandString)
-		fmt.Printf("Status: %s\n", taskInfo.Status)
-		fmt.Printf("Interactive: %t\n", taskInfo.IsInteractive)
-		fmt.Printf("Start Time: %s\n", taskInfo.StartTime.Format(time.RFC3339))
+		// Imprime as informações formatadas no output
+		fmt.Fprintf(output, "--- Task Status [%s] ---\n", taskInfo.ID)
+		fmt.Fprintf(output, "Command: %s\n", taskInfo.CommandString)
+		fmt.Fprintf(output, "Status: %s\n", taskInfo.Status)
+		fmt.Fprintf(output, "Interactive: %t\n", taskInfo.IsInteractive)
+		fmt.Fprintf(output, "Start Time: %s\n", taskInfo.StartTime.Format(time.RFC3339))
 		if !taskInfo.EndTime.IsZero() {
-			fmt.Printf("End Time: %s\n", taskInfo.EndTime.Format(time.RFC3339))
-			fmt.Printf("Duration: %s\n", taskInfo.EndTime.Sub(taskInfo.StartTime))
+			fmt.Fprintf(output, "End Time: %s\n", taskInfo.EndTime.Format(time.RFC3339))
+			fmt.Fprintf(output, "Duration: %s\n", taskInfo.EndTime.Sub(taskInfo.StartTime))
 		}
 		if taskInfo.Status == task.StatusSuccess || taskInfo.Status == task.StatusFailed || taskInfo.Status == task.StatusCancelled {
-			fmt.Printf("Exit Code: %d\n", taskInfo.ExitCode)
+			fmt.Fprintf(output, "Exit Code: %d\n", taskInfo.ExitCode)
 		}
 		if taskInfo.Error != nil {
-			fmt.Printf("Execution Error: %v\n", taskInfo.Error)
+			fmt.Fprintf(output, "Execution Error: %v\n", taskInfo.Error)
 		}
-		output := taskInfo.OutputBuffer.String()
-		if output != "" {
-			fmt.Printf("--- Output (last ~20 lines) ---\n")
-			// Mostra apenas as últimas linhas para não poluir muito
-			lines := strings.Split(strings.TrimSpace(output), "\n")
+		cmdOutput := taskInfo.OutputBuffer.String()
+		if cmdOutput != "" {
+			fmt.Fprintf(output, "--- Output (last ~20 lines) ---\n")
+			lines := strings.Split(strings.TrimSpace(cmdOutput), "\n")
 			start := len(lines) - 20
 			if start < 0 {
 				start = 0
 			}
-			fmt.Println(strings.Join(lines[start:], "\n"))
-			fmt.Printf("--- End Output ---\n")
+			fmt.Fprintln(output, strings.Join(lines[start:], "\n")) // Usa output
+			fmt.Fprintf(output, "--- End Output ---\n")
 		} else {
-			fmt.Println("Output: (empty)")
+			fmt.Fprintln(output, "Output: (empty)") // Usa output
 		}
-		fmt.Printf("--- End Task Status [%s] ---\n", taskInfo.ID)
+		fmt.Fprintf(output, "--- End Task Status [%s] ---\n", taskInfo.ID)
 
 	default:
-		fmt.Printf("Unknown task subcommand: %s\n", subcommand)
-		fmt.Println(c.Description())
+		fmt.Fprintf(output, "Unknown task subcommand: %s\n", subcommand) // Usa output
+		fmt.Fprintln(output, c.Description()) // Usa output
 	}
 
 	return nil

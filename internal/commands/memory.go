@@ -1,15 +1,20 @@
 package commands
 
-import "context"
+import (
+	"context"
+	"fmt"
+	"io"
+)
 
-// MemoryCmd implements the /memory command and its subcommands (save, list, load).
+// MemoryCmd implements the /memory command.
 type MemoryCmd struct {
-	// Needs access to the memory system (e.g., internal/memory.Manager)
+	// Needs access to the memory system
 }
 
 func (c *MemoryCmd) Name() string        { return "memory" }
-func (c *MemoryCmd) Description() string { return "Manages agent memory (subcommands: save, list, load)." }
-func (c *MemoryCmd) Execute(ctx context.Context, args []string) error {
-	// Implementation to parse subcommands (save, list, load) and interact with memory system
-	return nil // Placeholder
+func (c *MemoryCmd) Description() string { return "Manages agent memory (save, list, load). Usage: /memory <save|list|load> [name]" }
+func (c *MemoryCmd) Execute(ctx context.Context, args []string, output io.Writer) error {
+	// Placeholder implementation
+	fmt.Fprintln(output, "Memory command not yet implemented.")
+	return nil 
 } 

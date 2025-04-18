@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	geminiModelName = "gemini-2.0-flash"
+	// Removido: geminiModelName        = "gemini-1.5-flash"
 )
 
 // AgentResponse defines the expected JSON structure from the LLM.
@@ -47,6 +47,12 @@ var agentResponseSchema = &genai.Schema{
 	},
 }
 
+// InternalCommandResult armazena o resultado da execução de um comando interno.
+type InternalCommandResult struct {
+	Output string
+	Error  error
+}
+
 // Agent manages the main interaction loop, terminal, and LLM communication.
 type Agent struct {
 	termController terminal.Controller
@@ -60,10 +66,10 @@ type Agent struct {
 	stopChan      chan struct{}
 	cancelContext context.CancelFunc
 
-	// Rastreia a última tarefa iniciada (simplificação inicial)
 	lastSubmittedTaskID string
-	// Guarda informação sobre a última falha de ação para enviar ao LLM
 	lastActionFailure error 
+	// Guarda o resultado do último comando interno executado para incluir no próximo prompt
+	lastInternalResult *InternalCommandResult 
 }
 
 // GetExecutionManager retorna a instância do gerenciador de execução.
@@ -84,18 +90,22 @@ func NewAgent(ctx context.Context, cfg *config.Config, registry *commands.Regist
 	// --- Initialize Gemini Client using Config ---
 	apiKey := cfg.LLM.APIKey
 	modelName := cfg.LLM.ModelName
+	// Exigir que o nome do modelo esteja na configuração
 	if modelName == "" {
-		modelName = geminiModelName // Fallback para constante
+		return nil, fmt.Errorf("LLM model name (llm.model_name) is not specified in the configuration file")
 	}
-	log.Printf("Using model: %s", modelName)
-
+	log.Printf("Using model from config: %s", modelName)
 	var client *genai.Client
 	if apiKey != "" {
 		log.Println("Initializing Gemini client with API Key from config.")
 		client, err = genai.NewClient(ctx, option.WithAPIKey(apiKey))
 	} else {
 		log.Println("API Key not found in config. Attempting to use default credentials (ADC).")
-		client, err = genai.NewClient(ctx)
+		var clientErr error
+		client, clientErr = genai.NewClient(ctx)
+		if clientErr != nil {
+			return nil, fmt.Errorf("failed to create genai client with default credentials: %w", clientErr)
+		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to create genai client: %w", err)
@@ -170,7 +180,7 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	fmt.Println("Constructo Agent Started. Type your requests or /help.")
 
-	// 3. Main select loop - Agora orientado a eventos
+	// 3. Main select loop
 	for {
 		select {
 		case <-ctx.Done():
@@ -182,25 +192,37 @@ func (a *Agent) Run(ctx context.Context) error {
 			return nil
 
 		case line := <-a.userInputChan:
-			// fmt.Printf("[Debug] Received line from userInputChan: %q\n", line)
-			if !a.handleUserInput(ctx, line) {
-				// Se handleUserInput retornar false (não foi comando interno nem log)
-				// É uma requisição para o LLM
-				a.processAgentTurn(ctx, "user_input", line, nil)
+			isInternal, _ := a.parseUserInput(line) // Modificado para retornar se é interno
+			if !isInternal {
+				// É input para o LLM
+				a.processAgentTurn(ctx, "user_input", line, nil, nil)
+			} else {
+				// Usuário digitou um comando interno diretamente - executar e mostrar output,
+				// mas *não* enviar resultado para o LLM (para evitar loop se usuário digitar /task status)
+				fmt.Printf("[Executing Internal Command (User): %s]\n", line)
+				output, err := a.executeInternalCommand(ctx, line) 
+				if err != nil {
+					if errors.Is(err, commands.ErrExitRequested) {
+						fmt.Println(output) // Mostra a mensagem "Exiting..."
+						a.Stop()
+						return nil
+					}
+					fmt.Fprintf(os.Stderr, "Error executing internal command: %v\nOutput:\n%s\n", err, output)
+				} else {
+					fmt.Print(output) // Mostra a saída do comando interno diretamente
+				}
 			}
 
 		case event := <-a.execManager.Events():
 			log.Printf("[TaskManager Event]: ID=%s Type=%s Status=%s Err=%v", event.TaskID, event.EventType, event.Status, event.Error)
 			if event.EventType == "completed" {
-				// Pega o estado final da tarefa para incluir a saída
 				taskStatus, err := a.execManager.GetTaskStatus(event.TaskID)
 				if err != nil {
 					log.Printf("Error getting status for completed task %s: %v", event.TaskID, err)
 					// Decide o que fazer - talvez informar o LLM sobre o erro?
 					continue
 				}
-				// Chama o LLM com o resultado da tarefa
-				a.processAgentTurn(ctx, "task_completed", "", taskStatus)
+				a.processAgentTurn(ctx, "task_completed", "", taskStatus, nil) // Passa nil para internalResult
 			} else if event.EventType == "error" {
 				// Lidar com erros específicos do gerenciador, se houver
 				log.Printf("Execution manager reported error for task %s: %v", event.TaskID, event.Error)
@@ -241,46 +263,42 @@ func (a *Agent) readUserInput() {
 	}
 }
 
-// handleUserInput checks for internal commands or log feedback.
-// Returns true if the input was handled internally (command or ignored log).
-// Returns false if it's likely a request for the LLM.
-func (a *Agent) handleUserInput(ctx context.Context, line string) bool {
-	// Filtro de log
+// parseUserInput verifica se a linha é um comando interno ou log.
+// Retorna (isInternal, isLog).
+func (a *Agent) parseUserInput(line string) (bool, bool) {
+	// Filtro de log (como antes)
 	logPattern := `^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}`
 	matched, _ := regexp.MatchString(logPattern, line)
-	if matched || strings.HasPrefix(line, "[") || strings.HasPrefix(line, "User Request:") || strings.HasPrefix(line, "Event Trigger:") || strings.HasPrefix(line, "Configuration loaded") || strings.HasPrefix(line, "Starting Constructo Agent") || strings.HasPrefix(line, "Constructo Agent Started") || strings.HasPrefix(line, "Error calling Gemini") || strings.HasPrefix(line, "Google API Error Details"){
-		// log.Printf("[Debug] Ignored potential log feedback line: %q", line)
-		return true // Ignorado, considerado "tratado"
+	if matched || strings.HasPrefix(line, "[") || strings.Contains(line, "--- Sending") || strings.Contains(line, "Trigger:") || strings.Contains(line, "Task Result - ID:") || strings.Contains(line, "Action Failed:") {
+		return false, true // É log, não é comando interno
 	}
 
-	// Verifica comandos internos
 	if strings.HasPrefix(line, "/") {
-		parts := strings.Fields(line)
-		commandName := strings.TrimPrefix(parts[0], "/")
-		args := parts[1:]
-
-		cmd, exists := a.cmdRegistry.Get(commandName)
-		if !exists {
-			fmt.Printf("Unknown command: %s\n", commandName)
-			return true // Tratado (mostrando erro)
-		}
-
-		fmt.Printf("[Executing Internal Command: /%s]\n", commandName)
-		err := cmd.Execute(ctx, args)
-		if err != nil {
-			fmt.Printf("Error executing command /%s: %v\n", commandName, err)
-		}
-		// TODO: Comandos internos podem precisar interagir com o ExecutionManager também?
-		return true // Comando interno tratado
+		return true, false // É comando interno, não é log
 	}
 
-	// Se não for log e não for comando interno, é para o LLM
-	return false
+	return false, false // Não é comando interno nem log (é input para LLM)
+}
+
+// executeInternalCommand executa um comando interno e retorna sua saída e erro.
+func (a *Agent) executeInternalCommand(ctx context.Context, commandLine string) (output string, err error) {
+	parts := strings.Fields(commandLine)
+	commandName := strings.TrimPrefix(parts[0], "/")
+	args := parts[1:]
+
+	cmd, exists := a.cmdRegistry.Get(commandName)
+	if !exists {
+		return fmt.Sprintf("Unknown command: %s", commandName), nil // Retorna erro como output
+	}
+
+	outputBuf := new(bytes.Buffer)
+	execErr := cmd.Execute(ctx, args, outputBuf)
+	
+	return outputBuf.String(), execErr
 }
 
 // processAgentTurn collects context, calls LLM, and handles the response.
-// Agora recebe o input do usuário OU o resultado de uma tarefa concluída.
-func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput string, completedTask *task.Task) {
+func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput string, completedTask *task.Task, internalResult *InternalCommandResult) {
 	
 	// --- Validação UTF-8 da entrada do usuário ---
 	if userInput != "" && !utf8.ValidString(userInput) {
@@ -306,14 +324,29 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 	var currentTurnParts []genai.Part
 	contextInfo := bytes.NewBufferString("") 
 
-	// Incluir falha da ação anterior, se houver
+	// Incluir falha da ação anterior
 	a.mu.Lock()
 	lastFailure := a.lastActionFailure
-	a.lastActionFailure = nil // Limpa após incluir no contexto
+	a.lastActionFailure = nil 
+	// Incluir resultado do comando interno anterior
+	lastIntResult := a.lastInternalResult
+	a.lastInternalResult = nil // Limpa após incluir
 	a.mu.Unlock()
 	if lastFailure != nil {
 		fmt.Fprintf(contextInfo, "[Action Failed: %v]\n\n", lastFailure)
 		log.Printf("Including previous action failure in context: %v", lastFailure)
+	}
+	// Adiciona resultado do comando interno anterior ao contexto
+	if lastIntResult != nil {
+		fmt.Fprintf(contextInfo, "[Internal Command Result]\n")
+		output := lastIntResult.Output
+		if len(output) > 1000 { output = output[:1000] + "\n... (output truncated)" } // Limita output
+		fmt.Fprintf(contextInfo, "%s\n", output)
+		if lastIntResult.Error != nil {
+			// Não enviar o erro técnico, apenas a saída que pode conter a mensagem de erro
+			// fmt.Fprintf(contextInfo, "Error: %v\n", lastIntResult.Error) 
+		}
+		fmt.Fprintf(contextInfo, "[End Internal Command Result]\n\n")
 	}
 
 	// Adiciona resumo das tarefas em execução
@@ -322,14 +355,10 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 		fmt.Fprintf(contextInfo, "\n%s\n", runningSummary)
 	}
 
-	fmt.Fprintf(contextInfo, "\nTrigger: %s\n", trigger) // Movido para depois do resumo
+	fmt.Fprintf(contextInfo, "Trigger: %s\n", trigger) 
 
 	if userInput != "" {
-		// Turno iniciado pelo usuário
-		currentTurnParts = append(currentTurnParts, genai.Text(userInput))
-		log.Printf("--- Sending User Input to LLM ---")
-		log.Printf("User: %s", userInput)
-		log.Printf("--- End User Input ---")
+		fmt.Fprintf(contextInfo, "User Request: %s\n", userInput)
 	} else if completedTask != nil {
 		// Turno iniciado pela conclusão de uma tarefa
 		// Construir uma representação estruturada do resultado da tarefa
@@ -357,8 +386,8 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 		log.Printf("%s", taskResultText.String())
 		log.Printf("--- End Task Result ---")
 	} else {
-		log.Println("Warning: processAgentTurn called without user input or completed task.")
-		return // Nada a fazer
+		log.Println("Warning: processAgentTurn called without user input or completed task/internal result.")
+		return 
 	}
 
 	// Adiciona o contexto construído como genai.Text
@@ -380,6 +409,7 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 
 	// 2. Call LLM
 	fmt.Println("[Calling Gemini...] ")
+
 	// Envia as partes da *rodada atual*. O chatSession mantém o histórico anterior.
 	resp, err := a.chatSession.SendMessage(ctx, currentTurnParts...)
 	if err != nil {
@@ -438,21 +468,46 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 	}
 
 	if agentResp.Cmd != "" {
-		fmt.Printf("[Submitting Task: %s]\n", agentResp.Cmd)
-		isInteractive := false 
-		taskID, err := a.execManager.SubmitTask(ctx, agentResp.Cmd, isInteractive)
-		if err != nil {
-			failureMsg := fmt.Errorf("SubmitTask failed for command '%s': %w", agentResp.Cmd, err)
-			fmt.Fprintf(os.Stderr, "%v\n", failureMsg)
-			fmt.Printf("[Agent]: Failed to start command: %s\n", agentResp.Cmd)
+		if strings.HasPrefix(agentResp.Cmd, "/") {
+			// --- LLM solicitou comando interno --- 
+			fmt.Printf("[Executing Internal Command (LLM): %s]\n", agentResp.Cmd)
+			output, err := a.executeInternalCommand(ctx, agentResp.Cmd)
+			
+			// Guarda o resultado para o próximo turno
 			a.mu.Lock()
-			a.lastActionFailure = failureMsg // Guarda a falha
+			a.lastInternalResult = &InternalCommandResult{Output: output, Error: err}
 			a.mu.Unlock()
+
+			if err != nil {
+				if errors.Is(err, commands.ErrExitRequested) {
+					// LLM pediu para sair
+					fmt.Println(output) // Mostra a saída do comando exit
+					a.Stop()
+					return // Encerra o turno aqui
+				}
+				// Loga o erro, o resultado (incluindo a msg de erro) será enviado no próximo turno
+				log.Printf("Error executing internal command requested by LLM: %v", err)
+			}
+			// Não fazer mais nada neste turno, esperar o próximo para enviar o resultado
+
 		} else {
-			fmt.Printf("[Task %s Submitted]\n", taskID)
-			a.mu.Lock()
-			a.lastSubmittedTaskID = taskID 
-			a.mu.Unlock()
+			// --- LLM solicitou comando externo --- 
+			fmt.Printf("[Submitting Task: %s]\n", agentResp.Cmd)
+			isInteractive := false // TODO: decideIfInteractive
+			taskID, err := a.execManager.SubmitTask(ctx, agentResp.Cmd, isInteractive)
+			if err != nil {
+				failureMsg := fmt.Errorf("SubmitTask failed for command '%s': %w", agentResp.Cmd, err)
+				fmt.Fprintf(os.Stderr, "%v\n", failureMsg)
+				fmt.Printf("[Agent]: Failed to start command: %s\n", agentResp.Cmd)
+				a.mu.Lock()
+				a.lastActionFailure = failureMsg // Guarda a falha
+				a.mu.Unlock()
+			} else {
+				fmt.Printf("[Task %s Submitted]\n", taskID)
+				a.mu.Lock()
+				a.lastSubmittedTaskID = taskID 
+				a.mu.Unlock()
+			}
 		}
 	} else if agentResp.Signal != "" {
 		sig := mapSignal(agentResp.Signal)
