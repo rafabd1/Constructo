@@ -18,7 +18,8 @@ import (
 	"github.com/rafabd1/Constructo/internal/commands"
 	"github.com/rafabd1/Constructo/internal/config"
 	"github.com/rafabd1/Constructo/internal/task"
-	"github.com/rafabd1/Constructo/internal/terminal"
+
+	//"github.com/rafabd1/Constructo/internal/terminal"
 	"github.com/rafabd1/Constructo/pkg/events"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
@@ -48,7 +49,7 @@ type SignalDetails struct {
 
 // Agent manages the main interaction loop, terminal, and LLM communication.
 type Agent struct {
-	termController terminal.Controller
+	//termController terminal.Controller
 	cmdRegistry    *commands.Registry
 	genaiClient    *genai.Client
 	chatSession    *genai.ChatSession
@@ -279,30 +280,30 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 		fmt.Fprintf(contextInfo, "User Request: %s\n", userInput)
 	} else if completedTask != nil {
 		// Turno iniciado pela conclusão de uma tarefa
-		// Construir uma representação estruturada do resultado da tarefa
-		// Idealmente, usaríamos genai.FunctionResponse, mas vamos simular com texto estruturado por enquanto
-		// para manter a compatibilidade com o chatSession simples.
-		// Futuramente: Mudar para Function Calling/Tool Use real.
-		
-		taskResultText := bytes.NewBufferString("")
-		fmt.Fprintf(taskResultText, "[Task Result - ID: %s]\n", completedTask.ID)
-		fmt.Fprintf(taskResultText, "Command: %s\n", completedTask.CommandString)
+		taskResultText := bytes.NewBufferString("\n[Task Result Analysis Required]\n")
+		fmt.Fprintf(taskResultText, "Task ID: %s\n", completedTask.ID)
+		fmt.Fprintf(taskResultText, "Command: `%s`\n", completedTask.CommandString)
 		fmt.Fprintf(taskResultText, "Status: %s (Exit Code: %d)\n", completedTask.Status, completedTask.ExitCode)
 		if completedTask.Error != nil {
-			fmt.Fprintf(taskResultText, "Error: Execution failed\n") // Info simples para LLM
+			fmt.Fprintf(taskResultText, "Execution Error: %v\n", completedTask.Error)
+		} else {
+			fmt.Fprintf(taskResultText, "Execution Error: None\n")
 		}
-		output := completedTask.OutputBuffer.String()
-		if len(output) > 2000 { 
-			output = output[:2000] + "\n... (output truncated)"
-		}
-		fmt.Fprintf(taskResultText, "Output:\n%s\n", output)
-		fmt.Fprintf(taskResultText, "[End Task Result - ID: %s]", completedTask.ID)
 		
-		// Adicionar como uma parte de 'tool' ou 'function' simulada (usando role 'user' por enquanto)
+		output := completedTask.OutputBuffer.String()
+		outputSummary := output
+		maxLen := 1500
+		if len(output) > maxLen { 
+			outputSummary = output[:maxLen] + "\n... (output truncated)"
+		}
+		fmt.Fprintf(taskResultText, "Output (truncated if long):\n```\n%s\n```\n", outputSummary)
+		fmt.Fprintf(taskResultText, "[End Task Result]\n")
+		fmt.Fprintf(taskResultText, "Instruction: Analyze the task result above. If the task failed or the output indicates an unexpected problem, report the issue. If the task succeeded and completed the original user request, you can simply acknowledge it. If the task succeeded but further steps are needed based on the output, propose the next command or ask the user for clarification.\n")
+
 		currentTurnParts = append(currentTurnParts, genai.Text(taskResultText.String()))
-		log.Printf("--- Sending Task Result to LLM ---")
+		log.Printf("--- Sending Task Result to LLM (with analysis instruction) ---")
 		log.Printf("%s", taskResultText.String())
-		log.Printf("--- End Task Result ---")
+		log.Printf("--- End Task Result --- Gêmeos")
 	} else if internalResultOutput == nil && userInput == "" { // Modificado: só aviso se não houver NADA
 		log.Println("Warning: processAgentTurn called without user input or task/internal result.")
 		return 
@@ -532,6 +533,19 @@ func (a *Agent) ProcessUserInput(input string) {
 			a.processAgentTurn(a.ctx, "user_input", input, nil, nil)
 		}()
 	}
+}
+
+// ProcessTaskCompletion é chamado pela TUI quando uma tarefa externa termina.
+func (a *Agent) ProcessTaskCompletion(taskInfo *task.Task) {
+	if taskInfo == nil {
+		log.Println("[Agent ProcessTaskCompletion]: Received nil taskInfo.")
+		return
+	}
+	log.Printf("[Agent ProcessTaskCompletion]: Received completion for task %s (Status: %s)", taskInfo.ID, taskInfo.Status)
+	// Executa em goroutine para não bloquear a TUI
+	go func() {
+		a.processAgentTurn(a.ctx, "task_completed", "", taskInfo, nil)
+	}()
 }
 
 // SetProgram permite que a TUI injete a referência ao programa Bubble Tea.

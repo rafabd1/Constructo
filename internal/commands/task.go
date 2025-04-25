@@ -48,8 +48,10 @@ func (c *TaskCmd) Execute(ctx context.Context, args []string, output io.Writer) 
 	case "status":
 		taskInfo, err := execManager.GetTaskStatus(taskID)
 		if err != nil {
-			fmt.Fprintf(output, "Error getting status for task %s: %v\n", taskID, err) // Usa output
-			return nil 
+			// Usar formatação mais explícita para erro
+			formattedError := fmt.Sprintf("[Task Command Error]: Could not get status for task '%s'. Reason: %v", taskID, err)
+			fmt.Fprintln(output, formattedError)
+			return nil // Comando /task em si não falhou, apenas a operação interna
 		}
 
 		// Imprime as informações formatadas no output

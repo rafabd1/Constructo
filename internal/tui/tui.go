@@ -22,6 +22,8 @@ type AgentController interface {
 	// Stop sinaliza para o agente parar (pode ser necessário para Ctrl+C)
 	Stop() 
 	SetProgram(p *tea.Program)
+	// Novo método para processar conclusão de tarefas
+	ProcessTaskCompletion(taskInfo *task.Task)
 }
 
 // Model representa o estado da nossa TUI
@@ -141,23 +143,29 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		eventStr := formatTaskEvent(msg.Event)
 		m.messages = append(m.messages, m.taskStyle.Render(eventStr))
 		
-		// Exibir Output Buffer em caso de conclusão
+		// Se a tarefa foi concluída, buscar detalhes e exibir output
 		if msg.Event.EventType == "completed" {
-			// Buscar o estado completo da tarefa para obter o buffer
 			finalTaskStatus, err := m.taskManager.GetTaskStatus(msg.Event.TaskID)
 			if err != nil {
 				log.Printf("[TUI Update TaskMsg]: Error getting final status for task %s: %v", msg.Event.TaskID, err)
 				m.messages = append(m.messages, m.errorStyle.Render(fmt.Sprintf("  (Could not retrieve final output for task %s)", msg.Event.TaskID[:8])))
-			} else if finalTaskStatus.OutputBuffer != nil {
-				outputStr := finalTaskStatus.OutputBuffer.String()
-				if outputStr != "" {
-					maxLen := 500 
-					separator := "\n-------------------- Task Output End --------------------\n"
-					if len(outputStr) > maxLen {
-						outputStr = outputStr[:maxLen] + "\n... (output truncated)"
+			} else {
+				// Exibir output (se houver)
+				if finalTaskStatus.OutputBuffer != nil {
+					outputStr := finalTaskStatus.OutputBuffer.String()
+					if outputStr != "" {
+						maxLen := 500 
+						separator := "\n-------------------- Task Output End --------------------\n"
+						if len(outputStr) > maxLen {
+							outputStr = outputStr[:maxLen] + "\n... (output truncated)"
+						}
+						m.messages = append(m.messages, lipgloss.NewStyle().Faint(true).Render(outputStr)+separator)
 					}
-					m.messages = append(m.messages, lipgloss.NewStyle().Faint(true).Render(outputStr)+separator)
 				}
+				
+				// <<< ADICIONADO: Iniciar processamento pelo Agente >>>
+				log.Printf("[TUI TaskMsg]: Triggering Agent analysis for completed task %s", finalTaskStatus.ID[:8])
+				go m.agent.ProcessTaskCompletion(finalTaskStatus)
 			}
 		}
 
