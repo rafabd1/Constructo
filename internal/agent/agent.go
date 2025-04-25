@@ -29,22 +29,15 @@ const (
 	// Removido: geminiModelName        = "gemini-1.5-flash"
 )
 
-// --- NOVA Estrutura para Resposta JSON Esperada (Plain Text) ---
+// --- Estrutura para Resposta JSON Esperada (Plain Text - Achatada) ---
 type ParsedLLMResponse struct {
-	Type           string                 `json:"type"`           // "response", "command", "internal_command", "signal"
-	Message        string                 `json:"message"`        // Mandatory
-	CommandDetails *CommandDetails        `json:"command_details,omitempty"`
-	SignalDetails  *SignalDetails         `json:"signal_details,omitempty"`
-	// Adicionar outros campos do exemplo do usuário se necessário (risk, confirmation, etc.)
-}
-
-type CommandDetails struct {
-	Command string `json:"command"` // Mandatory if type is command/internal_command
-}
-
-type SignalDetails struct {
-	Signal string `json:"signal"`  // Mandatory if type is signal
-	TaskID string `json:"task_id"` // Mandatory if type is signal
+	Type    string `json:"type"`               // "response", "command", "internal_command", "signal"
+	Message string `json:"message"`            // Mandatory for response, optional otherwise
+	Command string `json:"command,omitempty"`  // Mandatory if type is command/internal_command
+	Signal  string `json:"signal,omitempty"`   // Mandatory if type is signal (e.g., "SIGINT")
+	TaskID  string `json:"task_id,omitempty"` // Mandatory if type is signal
+	// Risk           int    `json:"risk,omitempty"`          // Example field from user prompt, add if needed
+	// Confirmation   bool   `json:"confirmation,omitempty"`  // Example field
 }
 
 // Agent manages the main interaction loop, terminal, and LLM communication.
@@ -515,14 +508,14 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 
 	switch parsedResp.Type {
 	case "command":
-		if parsedResp.CommandDetails == nil || parsedResp.CommandDetails.Command == "" {
-			errMsg := "[Agent Error]: LLM response type is command but command_details.command is missing or empty."
+		if parsedResp.Command == "" { // Check flattened field
+			errMsg := "[Agent Error]: LLM response type is command but command field is missing or empty."
 			log.Println(errMsg)
 			a.contextLogger.Printf("[Error] %s", errMsg)
 			a.sendToTUI(events.AgentOutputMsg{Content: "[Agent Error]: Tried to run command but didn't specify which."})
 			break
 		}
-		cmdToRun := parsedResp.CommandDetails.Command
+		cmdToRun := parsedResp.Command // Use flattened field
 		a.contextLogger.Printf("[Action] Submitting External Command: %q", cmdToRun)
 		a.sendToTUI(events.AgentOutputMsg{Content: fmt.Sprintf("[Submitting Task: %s]", cmdToRun)})
 		isInteractive := false // TODO: Implement decideIfInteractive(cmdToRun)
@@ -542,14 +535,14 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 			a.mu.Unlock()
 		}
 	case "internal_command":
-		if parsedResp.CommandDetails == nil || parsedResp.CommandDetails.Command == "" {
-			errMsg := "[Agent Error]: LLM response type is internal_command but command_details.command is missing or empty."
+		if parsedResp.Command == "" { // Check flattened field
+			errMsg := "[Agent Error]: LLM response type is internal_command but command field is missing or empty."
 			log.Println(errMsg)
 			a.contextLogger.Printf("[Error] %s", errMsg)
 			a.sendToTUI(events.AgentOutputMsg{Content: "[Agent Error]: Tried to run internal command but didn't specify which."})
 			break
 		}
-		cmdToRun := parsedResp.CommandDetails.Command
+		cmdToRun := parsedResp.Command // Use flattened field
 		a.contextLogger.Printf("[Action] Executing Internal Command: %q", cmdToRun)
 		a.sendToTUI(events.AgentOutputMsg{Content: fmt.Sprintf("[Executing Internal Command: %s]", cmdToRun)})
 		output, err := a.executeInternalCommand(ctx, cmdToRun)
@@ -578,15 +571,15 @@ func (a *Agent) processAgentTurn(ctx context.Context, trigger string, userInput 
 		return // Prevent double end logging
 
 	case "signal":
-		if parsedResp.SignalDetails == nil || parsedResp.SignalDetails.Signal == "" || parsedResp.SignalDetails.TaskID == "" {
-			errMsg := "[Agent Error]: LLM response type is signal but signal_details are incomplete."
+		if parsedResp.Signal == "" || parsedResp.TaskID == "" { // Check flattened fields
+			errMsg := "[Agent Error]: LLM response type is signal but signal or task_id field is missing or empty."
 			log.Println(errMsg)
-			a.contextLogger.Printf("[Error] %s JSON: %+v", errMsg, parsedResp.SignalDetails)
+			a.contextLogger.Printf("[Error] %s JSON: %+v", errMsg, parsedResp) // Log the whole struct
 			a.sendToTUI(events.AgentOutputMsg{Content: "[Agent Error]: Tried to send signal but didn't specify signal or target."})
 			break
 		}
-		signalName := parsedResp.SignalDetails.Signal
-		targetTaskID := parsedResp.SignalDetails.TaskID
+		signalName := parsedResp.Signal   // Use flattened field
+		targetTaskID := parsedResp.TaskID // Use flattened field
 		sig := mapSignal(signalName)
 		if sig == nil {
 			errMsg := fmt.Sprintf("[Agent Error]: Unknown signal '%s'.", signalName)
